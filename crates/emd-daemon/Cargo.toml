@@ -1,0 +1,20 @@
+[package]
+name = "emd-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "无头采集进程：T1 全量轮、基准价落库，以及 M0.5 合规冒烟自检"
+
+[[bin]]
+name = "emd"
+path = "src/main.rs"
+
+[dependencies]
+emd-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

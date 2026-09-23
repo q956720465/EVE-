@@ -1,0 +1,27 @@
+[package]
+name = "emd-app"
+version = "0.1.0"
+description = "EVE 欧服市场独立客户端（Tauri 2 壳）"
+edition = "2021"
+rust-version = "1.85"
+
+[lib]
+name = "emd_app_lib"
+# 只留 rlib：staticlib/cdylib 是给 iOS/Android 壳用的，本项目只做 Windows 桌面。
+# 带上 cdylib 时 `cargo test` 会链出 emd_app_lib.dll，测试进程加载期就
+# STATUS_ENTRYPOINT_NOT_FOUND（清单与导出符号都不对）。
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# net：采集线程的 current-thread runtime 要 enable_all()；spawn_blocking 要 rt。
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "time", "sync", "net", "signal"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+emd-core = { path = "../emd-core" }

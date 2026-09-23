@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+*.sqlite3
+*.sqlite3-*
+.env
+
+# npm 依赖与构建产物不进库：lockfile 才是要提交的那份真相。
+node_modules/
+web/dist/
+
+# 工具链本地手稿（验收截图、临时快照目录）留在仓库外。
+_snapshots/
+*.tmp
+
+# Cargo.lock 要提交：本仓库产出的是应用（emd 可执行 + 未来的 Tauri 壳），
+# 锁死依赖版本才能让 M0.5 的节流实测结果在别的机器上复现。

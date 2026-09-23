@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"主窗口只需要核心的 IPC 调用能力；不开放 shell、fs、http 等插件权限 —— 前端唯一的网络出口是 Rust 侧。","local":true,"windows":["main"],"permissions":["core:default"]}}

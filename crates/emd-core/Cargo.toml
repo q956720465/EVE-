@@ -1,0 +1,23 @@
+[package]
+name = "emd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EVE 欧服市场客户端核心：ESI 客户端、节流、存储与订单簿聚合（不含 UI 依赖）"
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+httpdate = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+fs2 = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }

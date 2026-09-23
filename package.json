@@ -1,0 +1,11 @@
+{
+  "name": "eve-market-desk",
+  "private": true,
+  "version": "0.1.0",
+  "description": "工作区根：把前端的 dev/build 代理到 web/，让 Tauri 的 beforeDevCommand 在仓库根执行",
+  "scripts": {
+    "dev": "npm --prefix web run dev",
+    "build": "npm --prefix web run build",
+    "typecheck": "npm --prefix web run typecheck"
+  }
+}

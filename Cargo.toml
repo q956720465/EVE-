@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/emd-core", "crates/emd-daemon", "crates/emd-app"]
+# Tauri 壳带两百多个依赖，全量 `cargo build` 会把它一起拖慢。
+# 需要它时用 `cargo build -p emd-app` 或 `cargo tauri dev`。
+default-members = ["crates/emd-core", "crates/emd-daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+reqwest = { version = "0.12", features = ["gzip", "json", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+httpdate = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+fs2 = "0.3"
+
+emd-core = { path = "crates/emd-core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

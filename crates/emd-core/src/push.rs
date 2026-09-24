@@ -33,7 +33,7 @@
 //! 关键一条是 **`Failed` 一律不自动重试**：`errcode 40035`（缺 access_token）今天落在
 //! `Failed` 桶里（那是 T10 的映射，改动属它的边界），而"webhook 少 token"是"必须人工修
 //! 配置"——发送侧若重试 `Failed`，它就是一个永远好不了的循环。为此发送器在出发前多做一步
-//! **本地预检**（[`DingTalkChannel::preflight`]）：webhook 里没有 `access_token` 时直接判
+//! **本地预检**（`DingTalkChannel::preflight`，私有）：webhook 里没有 `access_token` 时直接判
 //! `ChannelDisabled`，连请求都不发，用户拿到的是一句能照着改的话。
 //!
 //! # 脱敏（Global Constraints，硬约束）
@@ -91,8 +91,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 中段打码：**任何可能带上 webhook / token / secret 的字符串**在进日志、进错误串、
 /// 回显给 UI 之前都必须过这里（Global Constraints 的脱敏硬约束）。
 ///
-/// 留头（≤[`MASK_HEAD_MAX`] 字符）是为了"看得出这是哪条通道"，留尾（≤[`MASK_TAIL_MAX`] 字符）
-/// 是为了"认得出是哪一条"，中间一律 [`MASK`]。头尾各自随长度按比例收缩（1/3 与 1/8），
+/// 留头（≤`MASK_HEAD_MAX` 字符）是为了"看得出这是哪条通道"，留尾（≤`MASK_TAIL_MAX` 字符）
+/// 是为了"认得出是哪一条"，中间一律 `MASK`。头尾各自随长度按比例收缩（1/3 与 1/8），
 /// 短串**整串**打码 —— 12 字符以内留头留尾就等于没打码，宁可让人认不出来，也不能把密钥留在明处。
 ///
 /// **它不是万能的**：不解析 URL 结构，也不逐字段打码。它只保证一件事 —— 头尾之外全被盖住。

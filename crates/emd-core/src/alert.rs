@@ -57,8 +57,9 @@ use crate::store::{CharOrder, Db, WalletTx};
 mod state;
 
 /// 告警状态机与闸门（spec §4.4）：边沿触发 / 深化穿透 / 日限按条目 / 跨周期保通知史。
-/// 判定（本文件上半）与状态机（[`state`]）分开：判定只管"这一轮亏没亏"，
-/// 状态机管"该不该推、推过几次"。
+/// 判定（本文件上半）与状态机（[`tick_alert`] / [`can_push_in`] / [`AlertRecord`]）分开：
+/// 判定只管"这一轮亏没亏"，状态机管"该不该推、推过几次"。
+/// （`state` 模块本身是私有的，这里只链再导出的公开条目。）
 pub use state::{
     can_push, can_push_in, day_entries_used, mark_pushed, tick_alert, AlertRecord, AlertState,
     ALERT_COOLDOWN_SECS, ALERT_DAILY_CAP, ALERT_DEEPEN_PP,
@@ -621,7 +622,7 @@ fn match_origin_orders(txs: &[WalletTx], orders: &[CharOrder]) -> HashMap<i64, i
 /// **函数的参数表里没有 `FeeModel`**，技能面板想借道也进不来（P4 的轨道分离靠签名）。
 ///
 /// 两条前置：被消耗批次的成本必须已知（`consumed_lot_costs` 的 `Unknown` 跳过），
-/// 且这笔成交的实付税必须在 journal 里看得到 —— 原料都拿不到就不判（见 [`journal_truth`]）。
+/// 且这笔成交的实付税必须在 journal 里看得到 —— 原料都拿不到就不判（见 `journal_truth`）。
 ///
 /// **`txs` 必须是 90 天窗口的全量流水**（`Db::load_char_tx` 按该窗口取回的那一份），不是本轮
 /// 增量切片 —— 增量里的买入解释不了更早卖掉的货，每一笔卖出都会因"有卖无买"被标 `Unknown`，
@@ -638,7 +639,7 @@ pub fn detect_realized(
 }
 
 /// 与 [`detect_realized`] 同一判据（同一段实现，参数表只差"真值已经在手"），供装配层用：
-/// journal 真值由 [`journal_truth`] 在同步返回后立刻抽出（P3 的消费点），判定侧拿到的就是
+/// journal 真值由 `journal_truth` 在同步返回后立刻抽出（P3 的消费点），判定侧拿到的就是
 /// 那两张字典 —— 不在这个函数里再解析一次 slice，避免"消费"变成两处口径。
 fn detect_realized_with(
     txs: &[WalletTx],

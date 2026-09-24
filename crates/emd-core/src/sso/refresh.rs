@@ -15,7 +15,7 @@
 //! - spec §4.1「令牌刷新仅在过期时发生」：未过期时**一个请求都不发**，也不写凭据库。
 //!
 //! 脱敏纪律（Global Constraints）：access_token、refresh_token 与表单体一律不进日志、
-//! 不进错误串 —— 本文件是这条链上唯一会拼错误串的地方，理由见 [`transport_kind`]。
+//! 不进错误串 —— 本文件是这条链上唯一会拼错误串的地方，理由见 `crate::push::transport_kind`。
 
 use std::time::Duration;
 

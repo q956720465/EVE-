@@ -81,7 +81,7 @@ fn sanitize_remote_text(s: &str) -> String {
 ///   `access_token`（旧刷新令牌仍然有效），所以空串的含义是"本次响应没给"，**不是**
 ///   "该令牌已失效"。**调用方负责沿用旧值**：解析层看不到旧值，无权替调用方决定。
 /// - 其余缺字段（`access_token` / `expires_in`）与错误体一律报错；报错信息里**只带错误码
-///   与净化后的描述**（[`sanitize_remote_text`]），不夹带响应体原文，令牌串不会经日志或
+///   与净化后的描述**（`sanitize_remote_text`），不夹带响应体原文，令牌串不会经日志或
 ///   UI 外泄。
 pub fn parse_token_response(bytes: &[u8], now: i64) -> Result<TokenSet> {
     let v: serde_json::Value = serde_json::from_slice(bytes)

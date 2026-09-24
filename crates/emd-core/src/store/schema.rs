@@ -213,6 +213,71 @@ CREATE TABLE history_log (
 );
 CREATE INDEX ix_history_log_started ON history_log (started_at DESC);
 "#,
+),
+(
+    5,
+    "M4b：跨区单簿（T1.5）、机会生命周期与 T1.5 台账",
+    r#"
+-- 机会生命周期（v3.1 §4.2）。主键即 opportunity_key：三个维度本身稳定、可读、
+-- 可查，哈希字符串只会给排障添堵。
+CREATE TABLE opportunities (
+    type_id                 INTEGER NOT NULL,
+    buy_loc                 INTEGER NOT NULL,
+    sell_loc                INTEGER NOT NULL,
+    state                   TEXT    NOT NULL,           -- new/notified/expired/invalidated
+    miss_streak             INTEGER NOT NULL DEFAULT 0,
+    first_seen_at           INTEGER NOT NULL,
+    last_seen_at            INTEGER NOT NULL,
+    best_margin_pct         REAL    NOT NULL DEFAULT 0,
+    last_margin_pct         REAL    NOT NULL DEFAULT 0,
+    last_net_total          REAL    NOT NULL DEFAULT 0,
+    last_qty                INTEGER NOT NULL DEFAULT 0,
+    notified_at             INTEGER,
+    notified_day            TEXT,
+    notified_count_day      INTEGER NOT NULL DEFAULT 0,
+    last_notified_margin_pct REAL,
+    PRIMARY KEY (type_id, buy_loc, sell_loc)
+);
+CREATE INDEX ix_opportunities_state ON opportunities (state, last_seen_at DESC);
+
+-- T1.5 跨区单簿：按 (站, 类型) UPSERT，只更新本批取到的类型；未取到的旧行
+-- 靠读取端 45 min 年龄闸门兜底、24h 剪除——表因此有界（3 枢纽 × ≤200 类型）。
+CREATE TABLE xregion_books (
+    location_id       INTEGER NOT NULL,
+    type_id           INTEGER NOT NULL,
+    region_id         INTEGER NOT NULL,
+    is_npc            INTEGER NOT NULL,
+    best_bid          REAL,
+    bid_qty           INTEGER NOT NULL DEFAULT 0,
+    best_ask          REAL,
+    ask_qty           INTEGER NOT NULL DEFAULT 0,
+    bid_levels        INTEGER NOT NULL DEFAULT 0,
+    ask_levels        INTEGER NOT NULL DEFAULT 0,
+    bid_depth         TEXT NOT NULL DEFAULT '[]',
+    ask_depth         TEXT NOT NULL DEFAULT '[]',
+    skipped_stale     INTEGER NOT NULL DEFAULT 0,
+    skipped_thin      INTEGER NOT NULL DEFAULT 0,
+    skipped_wholesale INTEGER NOT NULL DEFAULT 0,
+    fetched_at        INTEGER NOT NULL,
+    PRIMARY KEY (location_id, type_id)
+);
+CREATE INDEX ix_xregion_books_type ON xregion_books (type_id);
+
+-- 每趟 T1.5 台账（与 round_log 同纪律：只追加台账，不落行级数据）。
+CREATE TABLE xregion_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at    INTEGER NOT NULL,
+    types         INTEGER NOT NULL,
+    regions       INTEGER NOT NULL,
+    requests      INTEGER NOT NULL,
+    orders        INTEGER NOT NULL,
+    books_written INTEGER NOT NULL,
+    failed        INTEGER NOT NULL,
+    seconds       REAL    NOT NULL,
+    status        TEXT    NOT NULL
+);
+CREATE INDEX ix_xregion_log_started ON xregion_log (started_at DESC);
+"#,
 )];
 
 #[cfg(test)]
@@ -224,7 +289,7 @@ mod tests {
         for w in MIGRATIONS.windows(2) {
             assert!(w[0].0 < w[1].0, "迁移版本必须递增：{:?}", w);
         }
-        assert_eq!(MIGRATIONS.len(), 4);
+        assert_eq!(MIGRATIONS.len(), 5);
     }
 
     #[test]
@@ -246,10 +311,10 @@ mod tests {
 
     #[test]
     fn bounded_tables_never_key_on_a_timestamp() {
-        // station_orders / hub_pool 都是"只留最新一轮"的有界表。
-        // 一旦让 ts 进入主键，它们就退化成 v3.0 那种 47 GB 的追加表。
+        // station_orders / hub_pool / xregion_books / opportunities 都是"只留最新一轮/
+        // 有界"的表。一旦让 ts 进入主键，它们就退化成 v3.0 那种 47 GB 的追加表。
         for (version, _, sql) in MIGRATIONS {
-            for table in ["station_orders", "hub_pool"] {
+            for table in ["station_orders", "hub_pool", "xregion_books", "opportunities"] {
                 if let Some(rest) = sql.split(&format!("CREATE TABLE {table}")).nth(1) {
                     let body = rest.split("CREATE ").next().unwrap_or(rest);
                     let pk = body
@@ -279,5 +344,40 @@ mod tests {
             "station_orders 不得按时间戳累积历史"
         );
         assert!(!so.contains("\n    ts "), "快照表不应带逐轮 ts 列");
+    }
+
+    #[test]
+    fn migration_v5_keys_opportunities_by_the_three_dimensions() {
+        // opportunity_key 即三维复合键：类型 + 买站 + 卖站本身稳定、可读、可查，
+        // 哈希字符串只会给排障添堵（v3.1 §4.2 口径）。
+        let sql = MIGRATIONS[4].2;
+        let o = sql
+            .split("CREATE TABLE opportunities")
+            .nth(1)
+            .unwrap()
+            .split("CREATE INDEX")
+            .next()
+            .unwrap();
+        assert!(
+            o.contains("PRIMARY KEY (type_id, buy_loc, sell_loc)"),
+            "opportunity_key 即三维复合键，不用哈希字符串"
+        );
+        assert!(o.contains("notified_day"), "日上限需要自然日字段");
+    }
+
+    #[test]
+    fn xregion_books_is_bounded_and_age_stamped() {
+        // T1.5 跨区单簿：主键只 (站, 类型) —— 时间戳进主键会退化成追加表；
+        // fetched_at 是普通列，读取端按年龄闸门过滤，写入端整批替换。
+        let sql = MIGRATIONS[4].2;
+        let x = sql
+            .split("CREATE TABLE xregion_books")
+            .nth(1)
+            .unwrap()
+            .split("CREATE INDEX")
+            .next()
+            .unwrap();
+        assert!(x.contains("PRIMARY KEY (location_id, type_id)"));
+        assert!(x.contains("fetched_at"), "读取端要按年龄闸门过滤");
     }
 }

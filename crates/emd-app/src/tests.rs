@@ -308,7 +308,7 @@ async fn two_connections_on_one_file_share_the_schema() {
     let path = dir.join("emd.sqlite3");
     {
         let first = Db::open(&path).unwrap();
-        assert_eq!(first.schema_version().unwrap(), 4, "M3 迁移 v4 后要升到这里");
+        assert_eq!(first.schema_version().unwrap(), 5, "M4b 迁移 v5 后要升到这里");
         first.record_round(&RoundRecord {
             started_at: 1_700_000_000,
             region_id: 10000002,
@@ -325,7 +325,7 @@ async fn two_connections_on_one_file_share_the_schema() {
         .unwrap();
     }
     let second = Db::open(&path).unwrap();
-    assert_eq!(second.schema_version().unwrap(), 4);
+    assert_eq!(second.schema_version().unwrap(), 5);
     assert_eq!(second.round_count().unwrap(), 1, "另一条连接的写入要看得见");
     // WAL/SHM 句柄要随连接一起放掉，否则目录删不掉。
     drop(second);

@@ -4,12 +4,15 @@
 //! 协议常量核对（2026-09-24 对照 <https://developers.eveonline.com/docs/services/sso/>，
 //! 见计划「外部协议常量」节）：
 //! - 授权端点 `https://login.eveonline.com/v2/oauth/authorize`：已核对。
-//! - 令牌端点 `https://login.eveonline.com/v2/oauth/token`：已核对（T2 使用）。
+//! - 令牌端点 `https://login.eveonline.com/v2/oauth/token`：已核对；请求体字段与
+//!   native 无 secret 的说明见子模块 [`token`]（出处与日期在该文件顶部）。
 //! - PKCE `code_challenge_method=S256` 官方支持；native 应用必须先在开发者后台注册
 //!   redirect_uri（回环地址同样要注册，否则授权页直接报错）：已核对。
 //! - **待核**：scope 精确串。本模块不持有 scope 常量（由调用方传入，见 T12），
 //!   需注册应用后真机试授权才能确认无 `invalid_scope`。
-//! 若官方值变动，只改本文件与 `sso/token.rs` 的常量区。
+//! 若官方值变动，只改本文件与 [`token`] 两处（各持自己的端点常量）。
+
+pub mod token;
 
 use base64::Engine;
 use sha2::{Digest, Sha256};

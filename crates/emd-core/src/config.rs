@@ -322,10 +322,16 @@ mod tests {
     /// 分层加载（spec §4.1「设置页可配」的存储层）：库里的非空值赢过 env，空/缺回落 env。
     ///
     /// **本测试不碰进程环境变量**（同进程里 `char_switch_...` 那条在改 `EMD_CHAR_*`，
+    /// 同一进程里的环境变量是全局的：**改 env 的测试与拿 env 当基准的测试必须互斥**，
+    /// 否则并行执行时"开头取一份 `from_env()` 快照、后面再 `load()` 比较"会在别人正好
+    /// 改了 env 的那一瞬间随机失败。这把锁只给本文件里碰 `EMD_CHAR_*` 的两个测试用。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 断言一旦依赖 env 的具体取值，就变成"成败取决于别的测试有没有正好在改环境变量"）。
     /// 于是比较对象取**本测试开头那一份** `from_env()` 快照：env 里有什么都不影响断言方向。
     #[test]
     fn layered_load_prefers_stored_values_and_falls_back_to_env() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let db = Db::in_memory().unwrap();
         let env = CharConfig::from_env();
 
@@ -354,6 +360,7 @@ mod tests {
 
     #[test]
     fn char_switch_follows_the_configured_client_id_and_the_kill_switch() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // env 是运行期的唯一入口：配了 client_id 才算显式启用，EMD_CHAR_SYNC=0 无条件关闭。
         for v in ["EMD_CHAR_SYNC", "EMD_CHAR_CLIENT_ID", "EMD_CHAR_REDIRECT_URI"] {
             std::env::remove_var(v);

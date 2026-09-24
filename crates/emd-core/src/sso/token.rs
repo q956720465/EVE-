@@ -52,6 +52,23 @@ pub fn refresh_body(client_id: &str, refresh_token: &str) -> String {
     )
 }
 
+/// 远端错误文本（`error` / `error_description`）进日志前的净化。
+///
+/// 这两段是**对端可控**的原文，直接拼进错误串有两个问题：控制字符可以伪造日志行
+/// （`error_description` 里塞换行，日志里就多出一行看起来像我们自己打的记录），
+/// 超长描述会把上下文淹掉。所以只保留可打印字符并截断 —— 令牌端点的错误体本就不含
+/// 令牌，这里防的是日志被写坏，不是防泄漏。
+fn sanitize_remote_text(s: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let cleaned: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
+    let truncated = cleaned.len() > MAX_CHARS;
+    let mut out: String = cleaned.into_iter().take(MAX_CHARS).collect();
+    if truncated {
+        out.push('…');
+    }
+    out
+}
+
 /// 解析令牌端点响应（成功体与 RFC 6749 错误体都走这里）。
 ///
 /// 三条契约：
@@ -59,8 +76,9 @@ pub fn refresh_body(client_id: &str, refresh_token: &str) -> String {
 /// - **`refresh_token` 缺席时返回空串，而不是报错**。EVE 的刷新响应有时只回
 ///   `access_token`（旧刷新令牌仍然有效），所以空串的含义是"本次响应没给"，**不是**
 ///   "该令牌已失效"。**调用方负责沿用旧值**：解析层看不到旧值，无权替调用方决定。
-/// - 其余缺字段（`access_token` / `expires_in`）与错误体一律报错；报错信息里不夹带
-///   响应体内容，令牌串不会经日志或 UI 外泄。
+/// - 其余缺字段（`access_token` / `expires_in`）与错误体一律报错；报错信息里**只带错误码
+///   与净化后的描述**（[`sanitize_remote_text`]），不夹带响应体原文，令牌串不会经日志或
+///   UI 外泄。
 pub fn parse_token_response(bytes: &[u8], now: i64) -> Result<TokenSet> {
     let v: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| Error::Parse { url: TOKEN_ENDPOINT.to_string(), source: e })?;
@@ -72,7 +90,11 @@ pub fn parse_token_response(bytes: &[u8], now: i64) -> Result<TokenSet> {
             .get("error_description")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("（无 error_description）");
-        return Err(Error::Config(format!("SSO 令牌端点返回错误 {err}：{desc}")));
+        return Err(Error::Config(format!(
+            "SSO 令牌端点返回错误 {}：{}",
+            sanitize_remote_text(err),
+            sanitize_remote_text(desc)
+        )));
     }
 
     let access_token = v
@@ -140,6 +162,27 @@ mod tests {
         let e2 = parse_token_response(br#"{"error":"invalid_grant","error_description":"code expired"}"#, 1)
             .unwrap_err();
         assert!(e2.to_string().contains("invalid_grant"), "{e2}");
+    }
+
+    #[test]
+    fn remote_error_text_is_sanitized_before_it_reaches_the_log() {
+        // 远端可控文本防两件事：换行可以伪造日志行，超长会把上下文淹掉。
+        // 用 JSON 转义写换行，确认它到不了错误串里。
+        let e = parse_token_response(
+            br#"{"error":"invalid_grant","error_description":"line1\nline2\r\n[INFO] fake log line"}"#,
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("invalid_grant"), "{e}");
+        assert!(!e.contains('\n') && !e.contains('\r'), "控制字符必须被滤掉：{e}");
+        assert!(e.contains("line1line2"), "可见字符要保留：{e}");
+
+        let long = "x".repeat(500);
+        let body = format!(r#"{{"error":"invalid_client","error_description":"{long}"}}"#);
+        let e = parse_token_response(body.as_bytes(), 1).unwrap_err().to_string();
+        assert!(e.contains('…'), "超长描述要截断并标记：{}", &e[..e.len().min(80)]);
+        assert!(e.chars().count() < 300, "截断后不该还很长：{}", e.chars().count());
     }
 
     #[test]

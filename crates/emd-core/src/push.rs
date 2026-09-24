@@ -305,7 +305,11 @@ async fn judge(resp: reqwest::Response) -> PushOutcome {
 /// —— 里面有 `access_token` 与 `sign`。这里只取分类谓词：够分清"是配置错了还是网络不通"，
 /// 又不给日志留任何密钥。底层原因（DNS 失败、连接被拒这类文本）也刻意不带出来：
 /// 它们由第三方库拼，形状不可控，而分类信息对用户已经足够指路。
-fn transport_kind(e: &reqwest::Error) -> &'static str {
+///
+/// `pub(crate)` 而非私有：SSO 刷新（[`crate::sso::refresh`]）那条链上要同一份分类。原先
+/// 两处各持一份 6 行分类，理由是"比一条跨模块耦合便宜"——结果两份在 `is_builder` 的措辞上
+/// 已经漂移（"URL 或请求头非法" vs "端点 URL 或请求头非法"），正说明这种复制会静默分叉。
+pub(crate) fn transport_kind(e: &reqwest::Error) -> &'static str {
     if e.is_timeout() {
         "请求超时"
     } else if e.is_connect() {

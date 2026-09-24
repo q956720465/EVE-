@@ -20,6 +20,8 @@
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+// 分类清单与 push.rs 共用一份：两处曾各持一份，`is_builder` 的措辞已经分叉（T15 整改）。
+use crate::push::transport_kind;
 use crate::sso::store::TokenStore;
 use crate::sso::token::{parse_token_response, refresh_body, TokenSet};
 
@@ -123,32 +125,6 @@ pub async fn refresh_if_needed(
         "SSO 令牌已过期，刷新成功并写回凭据库"
     );
     Ok(updated)
-}
-
-/// `reqwest::Error` → 一句能读的**分类**串。
-///
-/// **绝不取 `Display`**：它的形状由第三方库决定（请求错误会附上 ` for url (...)`，`push.rs`
-/// 的 `transport_kind` 正为此而存在），而这里没有任何理由比那边宽松 —— 刷新令牌就在同一个
-/// 请求的表单体里，与其赌"底层库永远不会把请求上下文带出来"，不如一个字节都不带。
-/// 分类信息够指路（网络不通 / 超时 / 地址非法），又不给日志留任何令牌面。
-///
-/// 与 `push.rs` 的 `transport_kind` 同形不同处（**有意**）：那个是 `push.rs` 的私有函数，
-/// 本任务的文件白名单不含 `push*`，为共用它放开可见性只会平白多一条跨模块耦合；
-/// 两处各自持一份 6 行的分类，比一条共享依赖便宜。
-fn transport_kind(e: &reqwest::Error) -> &'static str {
-    if e.is_timeout() {
-        "请求超时"
-    } else if e.is_connect() {
-        "建立连接失败（网络不通 / 名字解析不了 / 连接被拒）"
-    } else if e.is_builder() {
-        "端点 URL 或请求头非法"
-    } else if e.is_body() {
-        "收发报文中断"
-    } else if e.is_decode() {
-        "响应无法解码"
-    } else {
-        "请求发送失败"
-    }
 }
 
 #[cfg(test)]

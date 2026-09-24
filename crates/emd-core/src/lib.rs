@@ -6,6 +6,7 @@
 //! 设计依据见《EVE 欧服市场客户端-开发方案 v3.1》§3.1、§3.4、§4.1、§5。
 
 pub mod catalog;
+pub mod char;
 pub mod collector;
 pub mod compliance;
 pub mod config;
@@ -17,6 +18,8 @@ pub mod sso;
 pub mod store;
 pub mod tree;
 
+pub use char::{sync_character, CharSyncReport, JournalEntry, SkillLevel};
+pub use char::fifo::{fifo_costs, CostSource, FifoCost};
 pub use config::EsiConfig;
 pub use error::{Error, Result};
 

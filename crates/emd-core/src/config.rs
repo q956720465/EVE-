@@ -87,6 +87,61 @@ impl EsiConfig {
     }
 }
 
+/// 角色挂链与亏损提醒的配置（spec §4.1 / §4.2）。
+///
+/// 默认**关闭**：SSO 与推送都要用户自己的凭证（`client_id`、钉钉机器人），
+/// 没配之前任何一轮都不该往外发请求。`redirect_uri` 与端口必须与开发者后台
+/// 注册值逐字符一致（EVE 精确匹配），故由配置给出、不在这里代猜。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CharConfig {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub loopback_port: u16,
+    /// 总开关：`EMD_CHAR_SYNC=0` 关闭。
+    pub enabled: bool,
+    /// 首启回填天数：只拉这个窗建 FIFO 成本基准，覆盖不到的类型标"成本未知"不参与判定。
+    pub backfill_days: i64,
+}
+
+impl Default for CharConfig {
+    fn default() -> Self {
+        Self {
+            client_id: String::new(),
+            redirect_uri: "http://127.0.0.1:8765/callback".into(),
+            loopback_port: 8765,
+            enabled: false,
+            backfill_days: 90,
+        }
+    }
+}
+
+impl CharConfig {
+    /// 运行期归一：配了 `client_id` 才算"用户显式启用"，`EMD_CHAR_SYNC=0` 无条件关闭
+    /// （照 `EMD_XREGION` 的先例 —— 默认值不走 env，测试不被环境左右）。
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let client_id = std::env::var("EMD_CHAR_CLIENT_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(d.client_id);
+        let redirect_uri = std::env::var("EMD_CHAR_REDIRECT_URI")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(d.redirect_uri);
+        let enabled = match std::env::var("EMD_CHAR_SYNC").ok().as_deref() {
+            Some("0") | Some("false") => false,
+            Some("1") | Some("true") => !client_id.is_empty(),
+            _ => !client_id.is_empty(),
+        };
+        Self {
+            client_id,
+            redirect_uri,
+            enabled,
+            ..d
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +188,43 @@ mod tests {
         assert_eq!(cfg.soft_budget(), 7_800);
         // 四枢纽档 3930 + 每 12 分钟 T1.5 的 2500 = 6430，须在软预算内。
         assert!(6_430 <= cfg.soft_budget() as usize);
+    }
+
+    #[test]
+    fn char_config_defaults_are_off_with_a_ninety_day_window() {
+        let cfg = CharConfig::default();
+        assert!(!cfg.enabled, "没配凭证之前不该去连 SSO");
+        assert!(cfg.client_id.is_empty());
+        assert_eq!(cfg.backfill_days, 90, "spec §4.2 的首启回填窗");
+        assert_eq!(cfg.loopback_port, 8765);
+        // 端口必须与 redirect_uri 里的那个一致（回环只绑这一个口）。
+        assert!(cfg.redirect_uri.contains(&cfg.loopback_port.to_string()));
+    }
+
+    #[test]
+    fn char_switch_follows_the_configured_client_id_and_the_kill_switch() {
+        // env 是运行期的唯一入口：配了 client_id 才算显式启用，EMD_CHAR_SYNC=0 无条件关闭。
+        for v in ["EMD_CHAR_SYNC", "EMD_CHAR_CLIENT_ID", "EMD_CHAR_REDIRECT_URI"] {
+            std::env::remove_var(v);
+        }
+        assert!(!CharConfig::from_env().enabled, "没配 client_id = 关闭");
+
+        std::env::set_var("EMD_CHAR_CLIENT_ID", "abc123");
+        assert!(CharConfig::from_env().enabled);
+        std::env::set_var("EMD_CHAR_SYNC", "0");
+        assert!(!CharConfig::from_env().enabled, "kill switch 优先于 client_id");
+        std::env::set_var("EMD_CHAR_SYNC", "1");
+        std::env::set_var("EMD_CHAR_CLIENT_ID", "   ");
+        assert!(!CharConfig::from_env().enabled, "空白 client_id 等于没配");
+
+        std::env::set_var("EMD_CHAR_CLIENT_ID", "abc123");
+        std::env::set_var("EMD_CHAR_REDIRECT_URI", "http://127.0.0.1:9999/cb");
+        let cfg = CharConfig::from_env();
+        assert_eq!(cfg.client_id, "abc123");
+        assert_eq!(cfg.redirect_uri, "http://127.0.0.1:9999/cb");
+
+        for v in ["EMD_CHAR_SYNC", "EMD_CHAR_CLIENT_ID", "EMD_CHAR_REDIRECT_URI"] {
+            std::env::remove_var(v);
+        }
     }
 }

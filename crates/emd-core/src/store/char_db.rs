@@ -109,6 +109,34 @@ impl Db {
             .optional()?)
     }
 
+    /// 增量水位的**唯一写路径**（`upsert_char_meta` 刻意不碰这三列）。
+    ///
+    /// **`None` = "这一列不动"，不是"清空"**：某一轮里某个端点没拉到、或响应没带
+    /// `Last-Modified` 时传 `None`，库里那份水位必须原样留着。反过来实现（`None` → 置 NULL）
+    /// 就是每轮把水位抹回起点：`since` 增量当场退化成"从 90 天前全量重拉"。
+    ///
+    /// 用 UPSERT 而不是 UPDATE：行还不存在时（同步先于登录落行）静默影响 0 行会让水位
+    /// 永远推不动，而"推不动"与"没数据"在库里看不出区别。`COALESCE` 让 `None` 与
+    /// "不动这一列"成为同一件事。
+    pub fn set_char_cursors(
+        &self,
+        char_id: u64,
+        tx_cursor: Option<&str>,
+        journal_cursor: Option<&str>,
+        orders_lm: Option<&str>,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO char_meta (char_id, tx_cursor, journal_cursor, orders_lm)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(char_id) DO UPDATE SET
+               tx_cursor = COALESCE(excluded.tx_cursor, char_meta.tx_cursor),
+               journal_cursor = COALESCE(excluded.journal_cursor, char_meta.journal_cursor),
+               orders_lm = COALESCE(excluded.orders_lm, char_meta.orders_lm)",
+            params![char_id as i64, tx_cursor, journal_cursor, orders_lm],
+        )?;
+        Ok(())
+    }
+
     /// 钱包流水落库。**幂等是硬要求**：`since` 增量窗口会重叠，同一笔
     /// transaction_id 每轮都可能再回来 —— 冲突就地更新，既不攒行也不报错。
     /// 整批一个事务：半批落库会让 FIFO 下次重放读到不完整的历史。
@@ -321,6 +349,51 @@ mod char_persist_tests {
         assert_eq!(tx_ids(&db, None), vec![11, 12, 900, 13], "裁剪前四行（按日期升序）");
         assert_eq!(db.prune_char_tx("2026-07-01").unwrap(), 1, "只剪严格早于 cutoff 的行");
         assert_eq!(tx_ids(&db, None), vec![12, 900, 13], "cutoff 当天算窗内，必须留下");
+    }
+
+    #[test]
+    fn set_char_cursors_treats_none_as_leave_this_column_alone() {
+        let db = Db::in_memory().unwrap();
+
+        // ① 还没挂链的角色也要能写：水位是同步管线自己的写路径，
+        //    若它在"行还不存在"时静默影响 0 行，增量水位就永远推不动、每轮退化成全量。
+        db.set_char_cursors(CHAR, Some("2026-09-19T00:00:00Z"), None, None)
+            .unwrap();
+        let m = db.char_meta(CHAR).unwrap().unwrap();
+        assert_eq!(m.tx_cursor.as_deref(), Some("2026-09-19T00:00:00Z"));
+        assert!(m.journal_cursor.is_none() && m.orders_lm.is_none());
+
+        // ② None = **不动这一列**，不是"清空"：某一轮没拉到 journal 时，
+        //    绝不能把上一轮的水位抹掉 —— 那等于下一轮从 90 天前重拉。
+        db.set_char_cursors(CHAR, None, Some("2026-09-18T00:00:00Z"), None)
+            .unwrap();
+        let m = db.char_meta(CHAR).unwrap().unwrap();
+        assert_eq!(
+            m.tx_cursor.as_deref(),
+            Some("2026-09-19T00:00:00Z"),
+            "None 不得清掉已有水位"
+        );
+        assert_eq!(m.journal_cursor.as_deref(), Some("2026-09-18T00:00:00Z"));
+
+        // ③ 三列全 None：什么都不动（也不是"全清"）。
+        db.set_char_cursors(CHAR, None, None, None).unwrap();
+        let m = db.char_meta(CHAR).unwrap().unwrap();
+        assert_eq!(m.tx_cursor.as_deref(), Some("2026-09-19T00:00:00Z"));
+        assert_eq!(m.journal_cursor.as_deref(), Some("2026-09-18T00:00:00Z"));
+
+        // ④ `orders_lm` 是 HTTP 日期原文（含逗号与空格），逐字符存。
+        let lm = "Wed, 17 Sep 2026 00:00:00 GMT";
+        db.set_char_cursors(CHAR, None, None, Some(lm)).unwrap();
+        assert_eq!(db.char_meta(CHAR).unwrap().unwrap().orders_lm.as_deref(), Some(lm));
+
+        // ⑤ 与元数据 UPSERT 合起来用（同步管线的真实顺序）：UPSERT 只碰自己那几列，
+        //    水位由本条通路独占推进 —— 两条写路径互不擦手。
+        db.upsert_char_meta(CHAR, "Pilot One", 1_700_000_000).unwrap();
+        let m = db.char_meta(CHAR).unwrap().unwrap();
+        assert_eq!(m.name.as_deref(), Some("Pilot One"));
+        assert_eq!(m.last_sync_at, Some(1_700_000_000));
+        assert_eq!(m.tx_cursor.as_deref(), Some("2026-09-19T00:00:00Z"));
+        assert_eq!(m.orders_lm.as_deref(), Some(lm));
     }
 
     #[test]

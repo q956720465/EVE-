@@ -23,7 +23,7 @@
 - Create: `crates/emd-core/src/market/flip.rs`
 - Modify: `crates/emd-core/src/market/mod.rs`（加 `pub mod flip;`）
 
-- [ ] **Step 1: 写失败测试**（flip.rs 底部 `#[cfg(test)] mod tests`）
+- [x] **Step 1: 写失败测试**（flip.rs 底部 `#[cfg(test)] mod tests`）
 
 ```rust
 #[test]
@@ -84,12 +84,12 @@ fn params_defaults_and_serde_roundtrip() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p emd-core flip 2>&1 | Select-String 'error|test result'`
 Expected: 编译失败（`FeeModel` 不存在）
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 //! 倒卖引擎（spec §2）。费率基 = 官方现行值：销售税 7.5%（2025-03 补丁）、
@@ -155,9 +155,9 @@ impl Default for FlipParams {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**（6 个用例全绿）
+- [x] **Step 4: 跑测试确认通过**（6 个用例全绿）
 
-- [ ] **Step 5: 提交** `git commit -m "feat(core): flip 费率与技能修正层（官方基率 7.5/3.0，Accounting −11%/级，BR −0.3pp/级+地板）"`
+- [x] **Step 5: 提交** `git commit -m "feat(core): flip 费率与技能修正层（官方基率 7.5/3.0，Accounting −11%/级，BR −0.3pp/级+地板）"`
 
 ---
 
@@ -165,7 +165,7 @@ impl Default for FlipParams {
 
 **Files:** Modify: `crates/emd-core/src/market/flip.rs`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 测试夹具（构造 `StationOrderBook`：`skipped_*`=0、`is_npc_station`=true）：
 
@@ -235,9 +235,9 @@ fn vol24_prefers_history_and_falls_back_to_depth() {
 fn sort_is_score_desc_then_stable_tiebreak() { /* 高分在前；同分按 (type_id, buy_loc, sell_loc) 升序 */ }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
-- [ ] **Step 3: 实现 scan 与输出结构**
+- [x] **Step 3: 实现 scan 与输出结构**
 
 ```rust
 use std::collections::{HashMap, HashSet};
@@ -332,9 +332,9 @@ pub fn trial(buy_price: f64, sell_price: f64, qty: u64, p: &FlipParams) -> (f64,
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**（Task 1+2 全绿）
+- [x] **Step 4: 跑测试确认通过**（Task 1+2 全绿）
 
-- [ ] **Step 5: 提交** `git commit -m "feat(core): flip 扫描核心（加权吃单/短填降级/全额税基/技能单调+v24 回落）"`
+- [x] **Step 5: 提交** `git commit -m "feat(core): flip 扫描核心（加权吃单/短填降级/全额税基/技能单调+v24 回落）"`
 
 ---
 
@@ -342,8 +342,8 @@ pub fn trial(buy_price: f64, sell_price: f64, qty: u64, p: &FlipParams) -> (f64,
 
 **Files:** Modify: `crates/emd-core/src/store/db.rs`
 
-- [ ] **Step 1: 读现有代码**：`meta` 表 KV 读写模式、`station_orders` 读取模式、`market_history` 查询模式、`round_log` 年龄查询模式（决定复用哪些私有 helper）
-- [ ] **Step 2: 写失败测试**（in-memory Db）
+- [x] **Step 1: 读现有代码**：`meta` 表 KV 读写模式、`station_orders` 读取模式、`market_history` 查询模式、`round_log` 年龄查询模式（决定复用哪些私有 helper）
+- [x] **Step 2: 写失败测试**（in-memory Db）
 
 ```rust
 #[test]
@@ -373,7 +373,7 @@ fn load_books_reads_back_aggregate_output() { /* 写一条 book_row → load_boo
 fn latest_vol24_takes_most_recent_date_per_type() { /* 两日期两类型；取各自最新 → HashMap{ty→vol} */ }
 ```
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 ```rust
 /// spec §2.2：参数进 meta KV（无迁移）；非法值拒绝而非静默存。
@@ -395,8 +395,8 @@ pub fn latest_vol24(&self) -> Result<HashMap<u32, u64>> { /* 每 type 取 MAX(da
 pub fn last_round_age_secs(&self) -> Result<Option<i64>> { /* round_log 最近 started_at → now − 之 */ }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
-- [ ] **Step 5: 提交** `git commit -m "feat(core): flip 参数 meta 持久化（非法拒绝）+ 扫描输入装配（books/hub/vol 年龄）"`
+- [x] **Step 4: 跑测试确认通过**
+- [x] **Step 5: 提交** `git commit -m "feat(core): flip 参数 meta 持久化（非法拒绝）+ 扫描输入装配（books/hub/vol 年龄）"`
 
 ---
 
@@ -404,17 +404,17 @@ pub fn last_round_age_secs(&self) -> Result<Option<i64>> { /* round_log 最近 s
 
 **Files:** Modify: `crates/emd-daemon/src/main.rs`（`enum Command` + `parse_args` + `print_usage` 三处同步）
 
-- [ ] **Step 1: 写失败测试**（跟现有 daemon 测试风格：parse 层）
+- [x] **Step 1: 写失败测试**（跟现有 daemon 测试风格：parse 层）
 
 ```rust
 #[test]
 fn parses_flip_with_top() { /* ["flip","--top","10"] → Command::Flip { top: 10 }；缺省 top=20 */ }
 ```
 
-- [ ] **Step 2: 实现**：`flip` 分支 = open db → `load_books`/`load_hub_pool`/`latest_vol24`/`get_flip_params` → `flip::scan` → 打印表（类型名/买站→卖站/买价/卖价/qty/净利率/净利/vol 来源）；0 机会打印 `pairs/dropped_batch/dropped_shortfall/dropped_threshold` 四计数。类型名与站点名复用现有查询 helper。
-- [ ] **Step 3: 跑测试**；`cargo build -p emd-daemon` 绿
-- [ ] **Step 4: 真机冒烟**：`emd-daemon flip --top 5`（读本机真库）
-- [ ] **Step 5: 提交** `git commit -m "feat(daemon): flip 子命令（Top N + 丢弃原因分布）"`
+- [x] **Step 2: 实现**：`flip` 分支 = open db → `load_books`/`load_hub_pool`/`latest_vol24`/`get_flip_params` → `flip::scan` → 打印表（类型名/买站→卖站/买价/卖价/qty/净利率/净利/vol 来源）；0 机会打印 `pairs/dropped_batch/dropped_shortfall/dropped_threshold` 四计数。类型名与站点名复用现有查询 helper。
+- [x] **Step 3: 跑测试**；`cargo build -p emd-daemon` 绿
+- [x] **Step 4: 真机冒烟**：`emd-daemon flip --top 5`（读本机真库）
+- [x] **Step 5: 提交** `git commit -m "feat(daemon): flip 子命令（Top N + 丢弃原因分布）"`
 
 ---
 
@@ -422,7 +422,7 @@ fn parses_flip_with_top() { /* ["flip","--top","10"] → Command::Flip { top: 10
 
 **Files:** Modify: `crates/emd-app/src/lib.rs`、`crates/emd-app/src/tests.rs`
 
-- [ ] **Step 1: 写失败测试**（tests.rs，沿用现有 invoke 测试模式）
+- [x] **Step 1: 写失败测试**（tests.rs，沿用现有 invoke 测试模式）
 
 ```rust
 #[test]
@@ -434,7 +434,7 @@ fn trial_calc_negative_with_default_rates_positive_with_max_skills() {
 fn flip_params_roundtrip_and_scan_shape() { /* set→get 相等；scan_flip 返回 rows+stats+age */ }
 ```
 
-- [ ] **Step 2: 实现 4 命令**（`impl AppState` 分层）：
+- [x] **Step 2: 实现 4 命令**（`impl AppState` 分层）：
 
 ```rust
 #[tauri::command] fn get_flip_params(state: State<AppState>) -> Result<FlipParams, String>
@@ -444,8 +444,8 @@ fn flip_params_roundtrip_and_scan_shape() { /* set→get 相等；scan_flip 返�
 // FlipRow = Opportunity + type_name + buy_loc_name + sell_loc_name；FlipScanOut { rows, stats, age_secs }
 ```
 
-- [ ] **Step 3: 跑测试**：`cargo test -p emd-app`
-- [ ] **Step 4: 提交** `git commit -m "feat(app): scan_flip/get/set_flip_params/trial_calc 命令（查看者也可用，纯本地）"`
+- [x] **Step 3: 跑测试**：`cargo test -p emd-app`
+- [x] **Step 4: 提交** `git commit -m "feat(app): scan_flip/get/set_flip_params/trial_calc 命令（查看者也可用，纯本地）"`
 
 ---
 
@@ -453,11 +453,11 @@ fn flip_params_roundtrip_and_scan_shape() { /* set→get 相等；scan_flip 返�
 
 **Files:** Modify: `web/src/types.ts`、`web/src/api.ts`、`web/src/store.ts`
 
-- [ ] **Step 1: types.ts**：`FeeModel`/`FlipParams`/`VolSource`/`FlipRow`/`FlipScanOut(resp)`/`TrialOut`/`FlipSortKey("score"|"profit")`（字段名与 Rust serde 一致 snake_case）
-- [ ] **Step 2: api.ts**：4 个 api 函数；`inTauri` 分支 invoke；fixture 分支 `fixFlip()` 返回 3 条演示行（含 1 条负 margin、vol 来源一 History 两 Depth）+ `fixTrial()` 返回预置结果（**fixture 数值为演示常数，不复刻费率公式——避免双源**，注释写明）
-- [ ] **Step 3: store.ts**：`view: "market" | "flip"`、`flipRows/flipStats/flipAge/flipParams/flipSort/flipLoading` + actions `setView/loadFlip/saveFlipParams/runTrial/setFlipSort`；`saveFlipParams` 成功后自动 `loadFlip()`（技能/参数改动 → 秒级重算闭环）
-- [ ] **Step 4: tsc**：`npx tsc --noEmit` = 0
-- [ ] **Step 5: 提交** `git commit -m "feat(web): 倒卖视图数据层（types/api/store/fixture）"`
+- [x] **Step 1: types.ts**：`FeeModel`/`FlipParams`/`VolSource`/`FlipRow`/`FlipScanOut(resp)`/`TrialOut`/`FlipSortKey("score"|"profit")`（字段名与 Rust serde 一致 snake_case）
+- [x] **Step 2: api.ts**：4 个 api 函数；`inTauri` 分支 invoke；fixture 分支 `fixFlip()` 返回 3 条演示行（含 1 条负 margin、vol 来源一 History 两 Depth）+ `fixTrial()` 返回预置结果（**fixture 数值为演示常数，不复刻费率公式——避免双源**，注释写明）
+- [x] **Step 3: store.ts**：`view: "market" | "flip"`、`flipRows/flipStats/flipAge/flipParams/flipSort/flipLoading` + actions `setView/loadFlip/saveFlipParams/runTrial/setFlipSort`；`saveFlipParams` 成功后自动 `loadFlip()`（技能/参数改动 → 秒级重算闭环）
+- [x] **Step 4: tsc**：`npx tsc --noEmit` = 0
+- [x] **Step 5: 提交** `git commit -m "feat(web): 倒卖视图数据层（types/api/store/fixture）"`
 
 ---
 
@@ -465,23 +465,51 @@ fn flip_params_roundtrip_and_scan_shape() { /* set→get 相等；scan_flip 返�
 
 **Files:** Create: `web/src/components/FlipScanner.tsx`；Modify: `web/src/components/TopBar.tsx`、`web/src/App.tsx`、`web/src/styles.css`
 
-- [ ] **Step 1: FlipScanner**：参数面板（折叠）+ 机会表 + 试算行
+- [x] **Step 1: FlipScanner**：参数面板（折叠）+ 机会表 + 试算行
   - 参数面板：费率基/阈值/资金/单笔比例/最小批量/单件运费/买入侧佣金开关 + 技能步进器（0–5，旁显 `销售税 7.5% → 3.38%`）；"保存并重算"走 `saveFlipParams`
   - 机会表列：类型名/买站→卖站/买价/卖价/可成交量/净利率/单位净利/总净利/24h 量（`History`/`Depth` 角标）/买站档位/卖站档位；数字列右对齐（复用单簿 grid 规范）；负净利率标红；排序键切换按钮（score/profit，前端本地重排）
   - 角标：`基于估算费率` 常驻；技能非 0 挂 `技能口径：Accounting A · BR B`；全 0 挂 `技能口径：无影响（游戏默认状态）`
   - 试算行：买价/卖价/数量 → `runTrial`；负数红字 + "扣税后亏损：改技能等级或放弃此单"
   - 空态：无快照 → "先跑一轮采集"；0 机会 → 显示 stats 四计数
-- [ ] **Step 2: TopBar** 加「市场 / 倒卖」切换（store.setView）；[App.tsx](file:///c:/EVE市场分析/eve-market-desk/web/src/App.tsx) 在 `view==="flip"` 时全宽渲染 FlipScanner（隐藏三栏）
-- [ ] **Step 3: styles.css**：`.flip*` 类，暗色主题对齐现有变量
-- [ ] **Step 4: build**：`npm run build` 绿（tsc + vite）
-- [ ] **Step 5: 浏览器复验**（Browser 子代理）：技能 0→5 切档角标/数值变化；试算负数标红；表格列对齐 <1px；控制台 0 error
-- [ ] **Step 6: 提交** `git commit -m "feat(web): 倒卖扫描器视图（参数/技能面板、机会表、试算行、视图切换）"`
+- [x] **Step 2: TopBar** 加「市场 / 倒卖」切换（store.setView）；[App.tsx](file:///c:/EVE市场分析/eve-market-desk/web/src/App.tsx) 在 `view==="flip"` 时全宽渲染 FlipScanner（隐藏三栏）
+- [x] **Step 3: styles.css**：`.flip*` 类，暗色主题对齐现有变量
+- [x] **Step 4: build**：`npm run build` 绿（tsc + vite）
+- [x] **Step 5: 浏览器复验**（Browser 子代理）：技能 0→5 切档角标/数值变化；试算负数标红；表格列对齐 <1px；控制台 0 error
+- [x] **Step 6: 提交** `git commit -m "feat(web): 倒卖扫描器视图（参数/技能面板、机会表、试算行、视图切换）"`
 
 ---
 
 ### Task 8: 收尾——全量回归 + CodeReview + 真机验收
 
-- [ ] **Step 1: 全量回归**：`cargo test -p emd-core -p emd-daemon -p emd-app`（预计 135+ 新用例全绿）+ `npx tsc --noEmit` + `npm run build`
-- [ ] **Step 2: CodeReview 子代理**（diff = M4a 全部提交），整改发现项
-- [ ] **Step 3: 真机验收**：daemon `flip` 真库 Top 10；浏览器：改技能 0→5 后 opportunities 数/margin 变化且与 daemon 输出同口径（同一快照）
-- [ ] **Step 4: 最终提交 + 报告**（含 R1–R8 裁决执行情况与挂账项）
+- [x] **Step 1: 全量回归**：`cargo test -p emd-core -p emd-daemon -p emd-app`（预计 135+ 新用例全绿）+ `npx tsc --noEmit` + `npm run build`
+- [x] **Step 2: CodeReview 子代理**（diff = M4a 全部提交），整改发现项
+- [x] **Step 3: 真机验收**：daemon `flip` 真库 Top 10；浏览器：改技能 0→5 后 opportunities 数/margin 变化且与 daemon 输出同口径（同一快照）
+- [x] **Step 4: 最终提交 + 报告**（含 R1–R8 裁决执行情况与挂账项）
+
+---
+
+## 执行报告（2026-09-24 收尾）
+
+**提交链**（master，全部经全量回归绿后提交）：
+`c181c7d` 费率层+扫描核心 → `e3806b8` meta 持久化+装配 → `d4d5213` daemon flip → `2a46ba9` app 四命令 → `7b94211` 技能临时覆盖 → `5ea7cac` web 视图 → `724bd63` 评审整改 → `d964500` 回归用例+fixture 镜像。
+
+**回归**：`cargo test` 三 crate 163 用例全绿（退出码 0）；`tsc --noEmit` 0；`vite build` 4.16s 成功。
+
+**真机验收**：
+- daemon 真库（16666 单簿/20 枢纽）：A0/B0 生效 7.50%/3.000%，快照 50322s 前评 268 对 0 机会如实输出（want<批量 231、未过阈值 37——快照 14h+ 所致，非引擎缺陷）；`--accounting 5 --broker-relations 5` 临时覆盖后生效 3.37%/1.500%，扫出真机会（Mexallon Uemon→Perkone 44.17→50.11，净利 7.92%）。
+- 浏览器 fixture：A0/B0 → A5/B5 切档保存后行列数字即时随动（Isogen 净利率 4.52%→11.09%），生效费率与 daemon 同口径逐位一致；试算 100/110×100 @A5/B5 = 单位净利 4.6375，与 Task 5 期望值吻合；负毛利 Eleutrium 标红。控制台无应用错误。
+
+**R1–R8 裁决执行情况**：
+- R1 基率 7.5/3.0：落地于 `FeeModel::default`，A0/B0 真机 0 机会正是该裁决预期的"真实成本"。
+- R2 地板 min(1%, 基率)：`effective_broker` 实现，单测覆盖基率<1.5% 边界。
+- R3 单件 ISK 运费：参数与扫描均按 `freight_isk_per_unit`；m3×跳数口径**挂账至 M4b**。
+- R4 预算 best_ask 估算不回退：`scan` 内一次定 budget_qty，无重算循环。
+- R5 vol24 回落 Depth 带角标：表格"成交/估算"角标已实现。
+- R6 试算 Rust 单源：`trial_calc` 命令；fixture 镜像显式标注"漂移以 Rust 为准"（`d964500`）。
+- R7 transaction_id 回填：属 M4b 已实现轨范围，M4a 未触碰。
+- R8 试算行替代 SSO：FlipScanner 试算行即本裁决载体。
+
+**挂账项**：
+1. `web/index.html` 引 `/favicon.ico` 但 `web/public/` 缺失，dev 控制台 404（不影响构建与功能）。
+2. vite 产物 >500kB 单 chunk 警告（图表库未分包），留待性能里程碑处理。
+3. R3 的 m3×跳数运费口径 → M4b。

@@ -2,6 +2,7 @@ mod aggregate;
 mod entities;
 pub mod flip;
 pub mod history;
+pub mod lifecycle;
 mod hubs;
 mod orderbook;
 

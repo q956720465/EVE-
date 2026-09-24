@@ -149,6 +149,71 @@ pub struct ScanOutcome {
     pub stats: ScanStats,
 }
 
+/// 单对站的裁决策略（scan 与生命周期复核共用，防两处口径漂移）。
+/// `NoMarket` = "市场不在"（买站无卖盘 / 吃单无成交）——生命周期按缺席计；
+/// `Dropped*` = "有盘但被过滤否掉"——生命周期按失效计（v3.1 §4.2）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PairVerdict {
+    Passed {
+        buy_price: f64,
+        sell_price: f64,
+        qty: u64,
+        net_per_unit: f64,
+        net_total: f64,
+        margin_pct: f64,
+    },
+    DroppedBatch,
+    DroppedShortfall,
+    DroppedThreshold,
+    NoMarket,
+}
+
+/// 目标量/加权价/税费与 scan 完全同一条路径（settle 唯一装配）。
+/// `DroppedShortfall` 与 scan 既有防御分支一致——正常数据下 want 已被
+/// 两侧容量裁剪，短填只在深度表与实际不一致时出现。
+pub fn evaluate_pair(a: &StationOrderBook, b: &StationOrderBook, p: &FlipParams) -> PairVerdict {
+    let broker = p.fees.effective_broker();
+    let tax = p.fees.effective_sales_tax();
+    // 买站：吃它的卖盘；没有卖盘就买不进。
+    let Some(best_ask) = a.best_ask.filter(|v| *v > 0.0) else {
+        return PairVerdict::NoMarket;
+    };
+    // 目标量 = min(两侧可执行深度, 预算 ÷ 卖一估价)。预算用 best_ask 估算、
+    // 结算用加权价，实际投入可能略低于上限——不回退重算（spec R4）。
+    let budget_qty = ((p.capital_isk * p.capital_pct_per_trade / 100.0) / best_ask).floor();
+    let want = (budget_qty.max(0.0) as u64)
+        .min(a.capacity(Side::Buy))
+        .min(b.capacity(Side::Sell));
+    if want < p.min_batch {
+        return PairVerdict::DroppedBatch;
+    }
+    let (Some((buy_px, filled_buy)), Some((sell_px, filled_sell))) =
+        (a.executable(Side::Buy, want), b.executable(Side::Sell, want))
+    else {
+        return PairVerdict::NoMarket;
+    };
+    let qty = filled_buy.min(filled_sell);
+    // 深度表与实际不一致时（旧版本截断等）如实降级，防御性分支。
+    if qty < p.min_batch {
+        return PairVerdict::DroppedShortfall;
+    }
+    let Some((net_per_unit, net_total, margin_pct)) = settle(buy_px, sell_px, qty, p, broker, tax)
+    else {
+        return PairVerdict::NoMarket;
+    };
+    if margin_pct < p.margin_threshold_pct {
+        return PairVerdict::DroppedThreshold;
+    }
+    PairVerdict::Passed {
+        buy_price: buy_px,
+        sell_price: sell_px,
+        qty,
+        net_per_unit,
+        net_total,
+        margin_pct,
+    }
+}
+
 /// 跨站价差扫描（spec §2.3）。
 ///
 /// 税基是**卖出成交全额**，不是差价——v3.0 公式在此修正（高估 7.7 倍的来源）。
@@ -160,8 +225,6 @@ pub fn scan(
     vol24: &HashMap<u32, u64>,
 ) -> ScanOutcome {
     let hub_set: HashSet<u64> = hubs.iter().map(|h| h.location_id).collect();
-    let broker = p.fees.effective_broker();
-    let tax = p.fees.effective_sales_tax();
 
     let mut by_type: HashMap<u32, Vec<&StationOrderBook>> = HashMap::new();
     for b in books {
@@ -173,73 +236,53 @@ pub fn scan(
     let mut out = ScanOutcome::default();
     for (&type_id, group) in &by_type {
         for a in group {
-            // 买站：吃它的卖盘；没有卖盘就买不进。
-            let Some(best_ask) = a.best_ask.filter(|v| *v > 0.0) else {
+            // 买站没有卖盘就买不进；不计入"评估对"——与抽取前统计口径逐位一致。
+            if a.best_ask.filter(|v| *v > 0.0).is_none() {
                 continue;
-            };
+            }
             for b in group {
-                // 卖站：吃它的买盘；同站对不是"跨站价差"。
+                // 同站对不是"跨站价差"。
                 if a.location_id == b.location_id {
                     continue;
                 }
                 out.stats.pairs_evaluated += 1;
-
-                // 目标量 = min(两侧可执行深度, 预算 ÷ 卖一估价)。
-                // 预算用 best_ask 估算、结算用加权价，实际投入可能略低于上限——
-                // 不回退重算，保证确定性（spec R4）。
-                let budget_qty =
-                    ((p.capital_isk * p.capital_pct_per_trade / 100.0) / best_ask).floor();
-                let want = (budget_qty.max(0.0) as u64)
-                    .min(a.capacity(Side::Buy))
-                    .min(b.capacity(Side::Sell));
-                if want < p.min_batch {
-                    out.stats.dropped_batch += 1;
-                    continue;
+                // 裁决与生命周期复核共用 evaluate_pair（含目标量/加权价/税费全链）。
+                match evaluate_pair(a, b, p) {
+                    PairVerdict::Passed {
+                        buy_price,
+                        sell_price,
+                        qty,
+                        net_per_unit,
+                        net_total,
+                        margin_pct,
+                    } => {
+                        // history 覆盖（自选/活跃池）优先；缺失回落可执行深度并标来源。
+                        let (v24, src) = match vol24.get(&type_id) {
+                            Some(&v) if v > 0 => (v, VolSource::History),
+                            _ => (qty, VolSource::Depth),
+                        };
+                        out.opportunities.push(Opportunity {
+                            type_id,
+                            buy_loc: a.location_id,
+                            sell_loc: b.location_id,
+                            buy_price,
+                            sell_price,
+                            qty,
+                            net_per_unit,
+                            net_total,
+                            margin_pct,
+                            vol24: v24,
+                            vol_source: src,
+                            buy_levels: a.ask_levels,
+                            sell_levels: b.bid_levels,
+                        });
+                    }
+                    // 统计口径与抽取前逐位一致：NoMarket 不计入任何计数（既有行为）。
+                    PairVerdict::DroppedBatch => out.stats.dropped_batch += 1,
+                    PairVerdict::DroppedShortfall => out.stats.dropped_shortfall += 1,
+                    PairVerdict::DroppedThreshold => out.stats.dropped_threshold += 1,
+                    PairVerdict::NoMarket => {}
                 }
-
-                let (Some((buy_px, filled_buy)), Some((sell_px, filled_sell))) =
-                    (a.executable(Side::Buy, want), b.executable(Side::Sell, want))
-                else {
-                    continue;
-                };
-                let qty = filled_buy.min(filled_sell);
-                // 深度表与实际不一致时（旧版本截断等）如实降级，防御性分支。
-                if qty < p.min_batch {
-                    out.stats.dropped_shortfall += 1;
-                    continue;
-                }
-                // 净额/成本装配与 trial 共用同一份实现（spec R6 防漂移）。
-                let Some((net_per_unit, net_total, margin_pct)) =
-                    settle(buy_px, sell_px, qty, p, broker, tax)
-                else {
-                    continue;
-                };
-                if margin_pct < p.margin_threshold_pct {
-                    out.stats.dropped_threshold += 1;
-                    continue;
-                }
-
-                // history 覆盖（自选/活跃池）优先；缺失回落可执行深度并标来源。
-                let (v24, src) = match vol24.get(&type_id) {
-                    Some(&v) if v > 0 => (v, VolSource::History),
-                    _ => (qty, VolSource::Depth),
-                };
-
-                out.opportunities.push(Opportunity {
-                    type_id,
-                    buy_loc: a.location_id,
-                    sell_loc: b.location_id,
-                    buy_price: buy_px,
-                    sell_price: sell_px,
-                    qty,
-                    net_per_unit,
-                    net_total,
-                    margin_pct,
-                    vol24: v24,
-                    vol_source: src,
-                    buy_levels: a.ask_levels,
-                    sell_levels: b.bid_levels,
-                });
             }
         }
     }
@@ -410,6 +453,63 @@ mod tests {
             book(STATION_JITA, 34, &[(100.0, 1000, 5)], &[]),
             book(60015157, 34, &[], &[(110.0, 1000, 5)]),
         ]
+    }
+
+    // ---- Task 1：evaluate_pair 抽取（状态机"失效"判定与 scan 同源） ----
+
+    #[test]
+    fn pair_verdict_passed_carries_settle_numbers() {
+        let books = doc_books();
+        let mut p = FlipParams::default();
+        p.fees.sales_tax_pct = 5.0;
+        p.fees.broker_pct = 3.0;
+        p.margin_threshold_pct = 0.0;
+        p.min_batch = 1;
+        p.capital_isk = 1_000_000.0;
+        match evaluate_pair(&books[0], &books[1], &p) {
+            PairVerdict::Passed { net_per_unit, qty, .. } => {
+                assert!((net_per_unit - 1.2).abs() < 1e-9, "与 scan 铁证同源");
+                assert_eq!(qty, 500);
+            }
+            other => panic!("应为 Passed：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn pair_verdict_classes_map_to_scan_stats() {
+        let books = doc_books();
+        let base = |p: &mut FlipParams| {
+            p.margin_threshold_pct = -100.0; // 不设阈，专测其它分档
+            p.min_batch = 1;
+            p.capital_isk = 1_000_000.0;
+        };
+        let mut p = FlipParams::default();
+        base(&mut p);
+        p.min_batch = 600;
+        assert_eq!(evaluate_pair(&books[0], &books[1], &p), PairVerdict::DroppedBatch);
+
+        let mut p2 = FlipParams::default();
+        base(&mut p2);
+        p2.margin_threshold_pct = 99.0;
+        assert_eq!(evaluate_pair(&books[0], &books[1], &p2), PairVerdict::DroppedThreshold);
+
+        // 买站没有卖盘（只有买单）→ NoMarket（生命周期按"缺席"计）
+        let no_ask = book(STATION_JITA, 34, &[], &[(110.0, 1000, 5)]);
+        let mut p3 = FlipParams::default();
+        base(&mut p3);
+        assert_eq!(evaluate_pair(&no_ask, &books[1], &p3), PairVerdict::NoMarket);
+    }
+
+    #[test]
+    fn scan_stats_unchanged_after_extraction() {
+        // 抽取重构后，既有统计口径必须逐位不变（防漂移回归）。
+        let mut p = FlipParams::default();
+        p.margin_threshold_pct = 3.0;
+        p.min_batch = 1;
+        p.capital_isk = 1_000_000.0;
+        let out = scan(&doc_books(), &hubs_of(&[STATION_JITA, 60015157]), &p, &HashMap::new());
+        assert_eq!(out.stats.pairs_evaluated, 1);
+        assert_eq!(out.stats.dropped_threshold, 1);
     }
 
     #[test]

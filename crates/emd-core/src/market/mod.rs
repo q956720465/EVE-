@@ -8,7 +8,7 @@ mod orderbook;
 pub use aggregate::{aggregate, AggregateOptions, PriceLevel, Side, StationOrderBook};
 pub use entities::{LocationKind, Order, OrdersResponse};
 pub use flip::{
-    scan, trial, FeeModel, FlipParams, Opportunity, ScanOutcome, ScanStats, VolSource,
+    scan, trial, FeeModel, FlipParams, Opportunity, PairVerdict, ScanOutcome, ScanStats, VolSource,
 };
 pub use history::{
     backfill, fetch_one, history_due, Fetched, HistoryConfig, PassReport, Estimate,

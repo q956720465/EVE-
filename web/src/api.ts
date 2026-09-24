@@ -1,4 +1,4 @@
-import type { AppStatus, FeeModel, FlipParams, FlipRow, FlipScan, HistoryBar, Hub, ListingRow, TrialOut, TreeGroup, TreeNode, TypeDetail } from "./types";
+import type { AlertPayload, AlertRow, AlertSettings, AlertSettingsIn, AppStatus, FeeModel, FlipParams, FlipRow, FlipScan, HistoryBar, Hub, ListingRow, SsoLoginOut, SsoStatus, TrialOut, TreeGroup, TreeNode, TypeDetail } from "./types";
 
 /**
  * 与 Rust 后端的唯一边界。
@@ -105,6 +105,51 @@ export const api = {
       return fixSettle(buyPrice, sellPrice, qty);
     }
     return call<TrialOut>("trial_calc", { buyPrice, sellPrice, qty });
+  },
+
+  // ---- M4c 提醒中心 ----
+
+  /** 告警列表（含已清的行：闸门只管推不推，从不删行）。 */
+  async alertsList(): Promise<AlertRow[]> {
+    if (!inTauri) return FIX_ALERTS;
+    return call<AlertRow[]>("alerts_list");
+  },
+
+  /** 通道配置回显（webhook 已打码，密钥只有"是否已配置"）。 */
+  async alertSettingsGet(): Promise<AlertSettings> {
+    if (!inTauri) return fixSettings;
+    return call<AlertSettings>("alert_settings_get");
+  },
+
+  /** 改通道配置。返回**重新打过码**的回显，面板用它刷新（而不是拿用户输入自己拼）。 */
+  async alertSettingsSet(input: AlertSettingsIn): Promise<AlertSettings> {
+    if (!inTauri) return fixSaveSettings(input);
+    return call<AlertSettings>("alert_settings_set", { input });
+  },
+
+  /** SSO 挂链状态（只含派生事实，没有任何令牌文本）。 */
+  async ssoStatus(): Promise<SsoStatus> {
+    if (!inTauri) return fixSsoStatus();
+    return call<SsoStatus>("sso_status");
+  },
+
+  /** 退出登录：清系统凭据库里的令牌（库内角色数据与告警表不动）。 */
+  async ssoLogout(): Promise<void> {
+    if (!inTauri) {
+      fixSsoLinked = false;
+      return;
+    }
+    await call("sso_logout");
+  },
+
+  /** 发起 SSO 登录：开系统浏览器等回调（最长 180 s），回执里只有角色身份。 */
+  async ssoLogin(): Promise<SsoLoginOut> {
+    if (!inTauri) {
+      // 预览不会真去开浏览器：把内存里的状态翻成"已登录"，让两种形态都能走查。
+      fixSsoLinked = true;
+      return { char_id: FIX_CHAR_ID, name: "Pilot One" };
+    }
+    return call<SsoLoginOut>("sso_login");
   },
 };
 
@@ -356,4 +401,220 @@ function fixFlip(): FlipScan {
     effective_sales_tax_pct: fixEffectiveTax(fixFlipParams.fees) * 100,
     effective_broker_pct: fixEffectiveBroker(fixFlipParams.fees) * 100,
   };
+}
+
+// ---- M4c 提醒中心的演示数据 ------------------------------------------------
+// 三条告警覆盖三种形态（expected_sell_loss / buy_order_trap / realized_loss），状态也各占一个
+//（notified / new / cleared）—— 走查时角标、通知史、口径摘要三块都能在屏幕上被看见，
+// 不用改代码去凑。数值取自 emd-core 的判定单测锚点：① 挂价 97 对 FIFO 成本 95（A5 口径）；
+// ② 买 100@100、可执行净额 95.125/件；③ journal 真值 9000 − 300 − 10000 − 270 = −1570。
+const FIX_CHAR_ID = 90_000_001;
+const FIX_ALERT_T0 = Math.floor(Date.now() / 1000);
+const ISO_DAY = (offsetDays: number) =>
+  new Date((FIX_ALERT_T0 + offsetDays * 86_400) * 1000).toISOString().slice(0, 10);
+
+function fixAlertPayload(p: AlertPayload): string {
+  // payload 列存的就是这段 JSON（推送卡片与提醒中心共用同一份序列化，spec §4.4）：
+  // 口径摘要在界面上是**从它里面读的**，不是后端另发的第二份结构。
+  return JSON.stringify(p);
+}
+
+const FIX_ALERTS: AlertRow[] = [
+  {
+    // ① 已推送的挂卖单预期亏（通知史里记的是亏损率，不是金额）
+    alert_key: "order:7001",
+    kind: "expected_sell_loss",
+    char_id: FIX_CHAR_ID,
+    type_id: 34,
+    type_name: "Tritanium",
+    location_id: 60003760,
+    location_name: "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
+    is_buy: false,
+    first_seen_at: FIX_ALERT_T0 - 5400,
+    last_seen_at: FIX_ALERT_T0 - 120,
+    last_loss_isk: 127.375,
+    last_margin_pct: -1.34,
+    state: "notified",
+    notified_at: FIX_ALERT_T0 - 300,
+    notified_day: ISO_DAY(0),
+    notified_count_day: 2,
+    last_notified_margin_pct: -1.34,
+    payload: fixAlertPayload({
+      alert_key: "order:7001",
+      kind: "expected_sell_loss",
+      order_id: 7001,
+      type_id: 34,
+      type_name: "Tritanium",
+      location_id: 60003760,
+      location_name: "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
+      is_buy: false,
+      price: 97,
+      volume: 100,
+      at: new Date((FIX_ALERT_T0 - 5400) * 1000).toISOString(),
+      loss_isk: 127.375,
+      margin_pct: -1.34,
+      caliber: {
+        track: "预期·估算费率",
+        sales_tax_pct: 3.375,
+        broker_pct: 0,
+        skill_caliber: "Accounting 5 / Broker Relations 0（税率随面板；中介费取 journal 实付）",
+        unit_cost: 95,
+        cost_source: "FIFO 90 天",
+        formula:
+          "① 单位净额 93.726250 = 挂价 97.000000 × (1 − 有效税 3.3750%)；单位全成本 95.000000 = FIFO 均价 95.000000 + 实付中介费/单位 0.000000",
+        data_age_secs: 60,
+      },
+    }),
+  },
+  {
+    // ② 挂买单套牢亏（未推送：状态 new）
+    alert_key: "order:7002",
+    kind: "buy_order_trap",
+    char_id: FIX_CHAR_ID,
+    type_id: 34,
+    type_name: "Tritanium",
+    location_id: 60003760,
+    location_name: "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
+    is_buy: true,
+    first_seen_at: FIX_ALERT_T0 - 600,
+    last_seen_at: FIX_ALERT_T0 - 60,
+    last_loss_isk: 975,
+    last_margin_pct: -4.875,
+    state: "new",
+    notified_at: null,
+    notified_day: null,
+    notified_count_day: 0,
+    last_notified_margin_pct: null,
+    payload: fixAlertPayload({
+      alert_key: "order:7002",
+      kind: "buy_order_trap",
+      order_id: 7002,
+      type_id: 34,
+      type_name: "Tritanium",
+      location_id: 60003760,
+      location_name: "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
+      is_buy: true,
+      price: 100,
+      volume: 200,
+      at: new Date((FIX_ALERT_T0 - 600) * 1000).toISOString(),
+      loss_isk: 975,
+      margin_pct: -4.875,
+      caliber: {
+        track: "预期·估算费率",
+        sales_tax_pct: 3.375,
+        broker_pct: 1.5,
+        skill_caliber: "Accounting 5 / Broker Relations 5（两侧费率均随面板重算）",
+        unit_cost: 100,
+        cost_source: "买单成交价 + 实付中介费",
+        formula:
+          "② 可执行卖出净额 95.125000/件 = 加权吃单买价 100.000000 × (1 − 税 3.3750% − 中介费 1.5000%)；买入成本 100.000000/件 = 挂价 100.000000 + 实付中介费/单位 0.000000",
+        data_age_secs: 45,
+      },
+    }),
+  },
+  {
+    // ③ 已实现成交亏（周期已结束：状态 cleared，行与通知史都留着）
+    alert_key: "tx:2",
+    kind: "realized_loss",
+    char_id: FIX_CHAR_ID,
+    type_id: 34,
+    type_name: "Tritanium",
+    location_id: 60003760,
+    location_name: "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
+    is_buy: false,
+    first_seen_at: FIX_ALERT_T0 - 604_800,
+    last_seen_at: FIX_ALERT_T0 - 86_400,
+    last_loss_isk: 1570,
+    last_margin_pct: -15.28,
+    state: "cleared",
+    notified_at: FIX_ALERT_T0 - 86_400,
+    notified_day: ISO_DAY(-1),
+    notified_count_day: 1,
+    last_notified_margin_pct: -12.5,
+    payload: fixAlertPayload({
+      alert_key: "tx:2",
+      kind: "realized_loss",
+      order_id: 555,
+      type_id: 34,
+      type_name: "Tritanium",
+      location_id: 60003760,
+      location_name: "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
+      is_buy: false,
+      price: 90,
+      volume: 100,
+      at: new Date((FIX_ALERT_T0 - 604_800) * 1000).toISOString(),
+      loss_isk: 1570,
+      margin_pct: -15.28,
+      caliber: {
+        track: "已实现·journal 真值",
+        sales_tax_pct: 3.3333333333333335,
+        broker_pct: 3,
+        skill_caliber: "不适用（journal 真值，技能面板不影响已实现轨）",
+        unit_cost: 102.7,
+        cost_source: "FIFO 90 天",
+        formula:
+          "③（journal 真值）净额 8700.000000 = 卖出所得 9000.000000 − 实付销售税 300.000000；全成本 10270.000000 = 被消耗批次 10000.000000 + 卖出侧实付中介费 270.000000（买入侧中介费本机无法归属，未计）",
+        data_age_secs: 388_800,
+      },
+    }),
+  },
+];
+
+/** 预览内存里的通道配置（真机上的那份住在 meta KV 里）。 */
+let fixSettings: AlertSettings = {
+  // 已中段打码的 webhook（形态照 `emd_core::push::mask`：头 ≤32 + `***` + 尾 ≤4）。
+  webhook: "https://oapi.dingtalk.com/robot/s***9f3a",
+  secret_set: true,
+  enabled: true,
+  channels: ["local", "dingtalk"],
+};
+
+/**
+ * 预览里的挂链状态。默认已挂链：未挂链那种形态能用「退出登录」当场走出来
+ * （真机上的令牌在系统凭据库里，浏览器预览里没有任何令牌可言）。
+ * 每次读都按"现在"重算时刻：写死在模块加载时刻的话，几分钟后有效期就成了一句假话。
+ */
+let fixSsoLinked = true;
+
+function fixSsoStatus(): SsoStatus {
+  const fresh = Math.floor(Date.now() / 1000);
+  return {
+    linked: fixSsoLinked,
+    char_id: fixSsoLinked ? FIX_CHAR_ID : null,
+    char_name: fixSsoLinked ? "Pilot One" : null,
+    last_sync_at: fixSsoLinked ? fresh - 95 : null,
+    expires_at: fixSsoLinked ? fresh + 960 : null,
+    token_expired: false,
+    char_sync_enabled: true,
+    client_id_set: true,
+    token_error: null,
+  };
+}
+
+/** `emd_core::push::mask` 的预览镜像：≥12 字符才留头尾，短串整串打码。 */
+function fixMask(s: string): string {
+  const chars = [...s];
+  const n = chars.length;
+  if (n === 0) return "";
+  if (n <= 12) return "***";
+  const head = Math.min(Math.floor(n / 3), 32);
+  const tail = Math.min(Math.floor(n / 8), 4);
+  return chars.slice(0, head).join("") + "***" + chars.slice(n - tail).join("");
+}
+
+/**
+ * `PushConfig::save_editing` 的预览镜像：只有"看得见的字段"能被改，密钥走三态。
+ * 公式与存储单源仍在 Rust；这里镜像的是**语义**——尤其是"打码值 = 保留原值"，
+ * 走查时要能看见"只翻开关不会把密钥清掉"这条（清错了之后每条推送都 310000）。
+ */
+function fixSaveSettings(input: AlertSettingsIn): AlertSettings {
+  const webhook = input.webhook.includes("***") ? fixSettings.webhook : fixMask(input.webhook.trim());
+  const secret_set = input.secret === undefined || input.secret === null ? fixSettings.secret_set : input.secret !== "";
+  fixSettings = {
+    webhook,
+    secret_set,
+    enabled: input.enabled,
+    channels: input.enabled && webhook.trim() !== "" ? ["local", "dingtalk"] : ["local"],
+  };
+  return fixSettings;
 }

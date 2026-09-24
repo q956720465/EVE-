@@ -576,3 +576,232 @@ button:hover {
   color: var(--dim);
   font-size: 11px;
 }
+
+/* ---------- M4c：提醒中心 ---------- */
+.alerts {
+  display: flex;
+  flex-direction: column;
+}
+.alerts h3 {
+  margin: 0 0 8px;
+}
+
+/* 「私有数据」提示条：全应用唯一碰角色私有数据的视图，必须常驻且显眼 ——
+   用户看别的视图时不会想到这一块是"我的账"（spec §4.5 的豁免记录）。 */
+.private-note {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--warn);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: rgba(255, 181, 71, 0.06);
+  color: var(--fg);
+  font-size: 11px;
+}
+.private-note b {
+  color: var(--warn);
+  margin-right: 6px;
+}
+
+/* 两块表单面板并排；窄窗自动堆成一列（见下面的 media query）。 */
+.alert-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.alert-grid .panel {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-width: 0;
+}
+.alert-grid .panel-ttl {
+  color: var(--dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 6px;
+}
+.kv {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 2px 10px;
+  align-items: baseline;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.kv > span:first-child {
+  color: var(--dim);
+  font-size: 11px;
+}
+.kv .dim {
+  color: var(--dim);
+}
+
+.alert-grid label.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 6px;
+}
+.alert-grid label.field input {
+  padding: 5px 8px;
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--fg);
+  outline: none;
+  font: inherit;
+}
+.alert-grid label.field input:focus {
+  border-color: var(--accent);
+}
+.alert-grid label.field input:disabled {
+  opacity: 0.5;
+}
+.alert-grid label.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 6px;
+}
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.row-actions button.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.small {
+  font-size: 11px;
+}
+.ok {
+  color: var(--accent);
+}
+.tag {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 6px;
+  margin-right: 4px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.tag.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 告警表：列多且口径列很长，走横向滚动（同 .flip-tablewrap 的纪律），
+   窄窗下宁可让表格滚动，也不让右侧列被裁掉。 */
+.alert-tablewrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.alert-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.alert-table th,
+.alert-table td {
+  padding: 5px 10px;
+  text-align: right;
+  font-size: 12px;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.alert-table th.l,
+.alert-table td.l {
+  text-align: left;
+}
+.alert-table th {
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 500;
+  border-bottom: 1px solid var(--line);
+}
+.alert-table tbody tr:hover {
+  background: #17212a;
+}
+.alert-table .dim {
+  color: var(--dim);
+  font-size: 11px;
+}
+.alert-table td.caliber {
+  /* 口径是**要给用户读的**（轨道/费率/单位成本/公式串），所以这一列允许换行；
+     限宽让公式串在行内折行，而不是把整张表撑到几千像素。 */
+  white-space: normal;
+  min-width: 320px;
+  max-width: 520px;
+}
+.alert-table .formula {
+  color: var(--fg);
+  font-size: 11px;
+  opacity: 0.85;
+  margin: 2px 0;
+}
+.alert-table .mono {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+}
+
+/* 形态角标：三种形态各有配色（预期轨两色系、已实现轨用主色），一眼分得清哪条是哪条。 */
+.kbadge,
+.sbadge {
+  display: inline-block;
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 1.5;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.k-expected_sell_loss {
+  color: var(--ask);
+  border-color: var(--ask);
+}
+.k-buy_order_trap {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.k-realized_loss {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.s-new {
+  color: var(--warn);
+}
+.s-notified {
+  color: var(--bid);
+}
+.s-cleared {
+  color: var(--dim);
+}
+
+@media (max-width: 900px) {
+  /* 窄窗：两块面板堆成一列，口径列收窄 —— 横向滚动留给表格自己。 */
+  .alert-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .alert-table td.caliber {
+    min-width: 240px;
+    max-width: 320px;
+  }
+}
+
+.alerts .note {
+  margin-top: 10px;
+  color: var(--dim);
+  font-size: 11px;
+}

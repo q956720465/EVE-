@@ -8,14 +8,21 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use emd_core::config::EsiConfig;
+use emd_core::alert::{
+    mark_pushed, AlertKind, AlertPayload, AlertRecord, AlertState, CaliberSummary,
+    COST_SRC_FIFO90, TRACK_EXPECTED,
+};
+use emd_core::config::{CharConfig, EsiConfig};
 use emd_core::esi::EsiClient;
 use emd_core::market::{aggregate, AggregateOptions, Hub, Order, STATION_JITA};
+use emd_core::push::PushConfig;
 use emd_core::scheduler::{RoundState, Stage};
-use emd_core::store::{Db, HistoryRow, RoundRecord};
+use emd_core::sso::store::{MemoryTokenStore, TokenStore};
+use emd_core::sso::token::TokenSet;
+use emd_core::store::{now_unix, Db, HistoryRow, RoundRecord};
 use emd_core::tree::{CategoryDetail, GroupDetail};
 
-use super::AppState;
+use super::{AlertSettingsIn, AppState};
 
 fn order(price: f64, is_buy: bool, vol: u64) -> Order {
     Order {
@@ -116,14 +123,24 @@ fn state(latest: Option<RoundState>) -> AppState {
     state_with(seeded(), latest)
 }
 
-fn state_with(db: Db, latest: Option<RoundState>) -> AppState {
+/// 令牌源与 SSO 配置可换的状态：`sso_status`/`sso_logout`/`sso_login` 的测试要在同一份状态上
+/// 注入内存凭据库（真实现在系统凭据库里，测试不许碰用户的凭据）。
+fn state_sso(db: Db, tokens: Arc<dyn TokenStore>, cfg: CharConfig) -> AppState {
     AppState {
         db: Arc::new(Mutex::new(db)),
         client: Arc::new(EsiClient::new(EsiConfig::default()).unwrap()),
-        latest: Arc::new(Mutex::new(latest.map(|s| (s, Instant::now())))),
+        latest: Arc::new(Mutex::new(None)),
         shutdown: tokio::sync::watch::channel(false).0,
         collector: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tokens,
+        cfg,
     }
+}
+
+fn state_with(db: Db, latest: Option<RoundState>) -> AppState {
+    let mut st = state_sso(db, Arc::new(MemoryTokenStore::default()), CharConfig::default());
+    st.latest = Arc::new(Mutex::new(latest.map(|s| (s, Instant::now()))));
+    st
 }
 
 /// 模拟"本进程抢到采集锁"：collecting 的真相是锁归属，不是状态通道。
@@ -235,13 +252,7 @@ async fn snapshot_time_falls_back_to_the_database_during_a_round() {
 
 #[tokio::test]
 async fn cold_database_reports_idle_instead_of_erroring() {
-    let st = AppState {
-        db: Arc::new(Mutex::new(Db::in_memory().unwrap())),
-        client: Arc::new(EsiClient::new(EsiConfig::default()).unwrap()),
-        latest: Arc::new(Mutex::new(None)),
-        shutdown: tokio::sync::watch::channel(false).0,
-        collector: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
+    let st = state_with(Db::in_memory().unwrap(), None);
     let out = st.status().await.unwrap();
     assert_eq!(out.stage, "Idle");
     assert_eq!(out.round, 0);
@@ -539,4 +550,347 @@ async fn scan_flip_marks_xregion_age_on_rows() {
         "刚写入 → 年龄接近 0，实际值 {:?}",
         row.xregion_age_secs
     );
+}
+
+// ---- M4c：提醒中心与通道配置（T14） --------------------------------------
+
+/// 合成 JWT（照 `emd-daemon` 的 `char_status_output_carries_no_token_material` 先例）：
+/// payload 段是 `{"sub":"CHARACTER:EVE:90000001","name":"Pilot One","exp":1790000000}` 的
+/// base64url（无 padding），签名段塞哨兵 —— 真令牌的签名段同样是不可读的随机串。
+/// 哨兵串真切进过解析器（下面的正向断言证明角色身份是从**这个**令牌里解出来的），
+/// 所以"输出里没有哨兵"不是因为函数压根没看令牌。
+const AT_SIG: &str = "AT-SENTINEL-ACCESS-TOKEN-9f3a";
+const RT_SENTINEL: &str = "RT-SENTINEL-REFRESH-TOKEN-7b21";
+const JWT_PAYLOAD: &str = "eyJzdWIiOiJDSEFSQUNURVI6RVZFOjkwMDAwMDAxIiwibmFtZSI6IlBpbG90IE9uZSIsImV4cCI6MTc5MDAwMDAwMH0";
+
+fn fake_token(expires_at: i64) -> TokenSet {
+    TokenSet {
+        access_token: format!("eyJhbGciOiJub25lIn0.{JWT_PAYLOAD}.{AT_SIG}"),
+        refresh_token: RT_SENTINEL.to_string(),
+        expires_at,
+    }
+}
+
+/// 一张告警载荷（字段照 T8 契约）。名字用字典里的真名与真站点名，便于断言回填确实走了库；
+/// 口径摘要的两条串走 `emd-core` 的公开常量，测试里不手抄字面量。
+fn alert_payload(key: &str, kind: AlertKind) -> AlertPayload {
+    AlertPayload {
+        alert_key: key.to_string(),
+        kind,
+        order_id: 7001,
+        type_id: 34,
+        type_name: "Tritanium".to_string(),
+        location_id: STATION_JITA,
+        location_name: "Jita IV - Moon 4".to_string(),
+        is_buy: matches!(kind, AlertKind::BuyOrderTrap),
+        price: 97.0,
+        volume: 100,
+        at: chrono::DateTime::parse_from_rfc3339("2026-09-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        loss_isk: 127.375,
+        margin_pct: -1.34,
+        caliber: CaliberSummary {
+            track: TRACK_EXPECTED.to_string(),
+            sales_tax_pct: 3.375,
+            broker_pct: 0.0,
+            skill_caliber: "Accounting 5 / Broker Relations 0".to_string(),
+            unit_cost: 95.0,
+            cost_source: COST_SRC_FIFO90.to_string(),
+            formula: "① 单位净额 93.72625 = 挂价 97 × (1 − 有效税 3.375%)".to_string(),
+            data_age_secs: 60,
+        },
+    }
+}
+
+/// 直接读库里的通道配置：断言"写进去的到底是什么"，而不是只看命令回显。
+fn stored_push_config(st: &AppState) -> PushConfig {
+    PushConfig::load(&st.db.lock().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn alert_rows_carry_kind_names_and_notification_history() {
+    const CHAR: u64 = 90_000_001;
+    let db = seeded();
+    // ① 已推送的挂单轨：通知史里记的是**亏损率**（穿透判定比"再低 2pp"），不是金额。
+    let mut notified = AlertRecord::from_payload(
+        &alert_payload("order:7001", AlertKind::ExpectedSellLoss),
+        CHAR,
+        1_790_000_000,
+    );
+    mark_pushed(&mut notified, 1_790_000_000, "2026-09-24");
+    db.save_alert(&notified).unwrap();
+    // ② 周期结束的已实现轨：行留在提醒中心（闸门只管推不推，从不删行）。
+    let mut cleared = AlertRecord::from_payload(
+        &alert_payload("tx:2", AlertKind::RealizedLoss),
+        CHAR,
+        1_789_000_000,
+    );
+    cleared.state = AlertState::Cleared;
+    db.save_alert(&cleared).unwrap();
+    // ③ 名字字典里没有的类型/站点：fallback 串必须顶上，而不是整行消失。
+    let mut unknown = alert_payload("order:7002", AlertKind::BuyOrderTrap);
+    unknown.type_id = 88_087;
+    unknown.location_id = 60_008_494;
+    unknown.loss_isk = 975.0;
+    unknown.margin_pct = -4.875;
+    db.save_alert(&AlertRecord::from_payload(&unknown, CHAR, 1_788_000_000))
+        .unwrap();
+
+    let st = state_with(db, None);
+    let rows = st.alerts_list().await.unwrap();
+    assert_eq!(rows.len(), 3, "三种形态各一行：{rows:?}");
+
+    // 顺序 = load_alerts 的口径：最后见到在前（提醒中心要"最近出现的先看到"）。
+    let r = &rows[0];
+    assert_eq!(r.alert_key, "order:7001", "去重键原样透传（TEXT 形态是检索入口）");
+    assert_eq!(r.kind, "expected_sell_loss", "落库串与 UI 角标走同一套 snake_case 映射");
+    assert_eq!(r.state, "notified");
+    assert_eq!(r.char_id, CHAR);
+    assert_eq!(r.type_name, "Tritanium", "名字回填走字典");
+    assert_eq!(r.location_name, "Jita IV - Moon 4");
+    assert!(!r.is_buy, "挂卖单轨的方向是「卖」");
+    assert!((r.last_loss_isk - 127.375).abs() < 1e-9, "亏损额是 ISK");
+    assert!((r.last_margin_pct + 1.34).abs() < 1e-9);
+    assert_eq!(r.notified_day.as_deref(), Some("2026-09-24"));
+    assert_eq!(r.notified_count_day, 1);
+    assert_eq!(
+        r.last_notified_margin_pct,
+        Some(-1.34),
+        "这一列存的是**上次推送时的亏损率**（pp），不是亏损额 —— 拿 127.375 当它就是把两个单位混了"
+    );
+    assert!(
+        r.payload.contains("\"alert_key\":\"order:7001\""),
+        "payload 是推送卡片与提醒中心共用的那一份序列化：{}",
+        r.payload
+    );
+    assert!(
+        r.payload.contains("\"track\":\"预期·估算费率\""),
+        "口径摘要必须跟过来（面板从 payload 里读它，不另造结构）：{}",
+        r.payload
+    );
+
+    assert_eq!(rows[1].kind, "realized_loss");
+    assert_eq!(rows[1].state, "cleared", "已清的行照样在列表里");
+    assert_eq!(rows[1].notified_count_day, 0, "没推过的条目通知计数为 0");
+
+    let r = &rows[2];
+    assert_eq!(r.kind, "buy_order_trap");
+    assert!(r.is_buy, "买单轨的方向是「买」");
+    assert_eq!(r.type_name, "type_id 88087", "未命名类型用 fallback 串（照 flip_scan 先例）");
+    assert_eq!(r.location_name, "站点 #60008494", "未解名站点用 fallback 串");
+    assert_eq!(r.first_seen_at, 1_788_000_000);
+    assert_eq!(r.last_seen_at, 1_788_000_000);
+}
+
+#[tokio::test]
+async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
+    const TOKEN: &str = "tok0000000000000000000000000000000000000000000000000000000000000fake";
+    const SECRET: &str = "SEC0000000000000000000000000000000000000000000000000000000000000fake";
+    let db = Db::in_memory().unwrap();
+    let webhook = format!("https://oapi.dingtalk.com/robot/send?access_token={TOKEN}");
+    PushConfig {
+        webhook: webhook.clone(),
+        secret: SECRET.to_string(),
+        enabled: false,
+    }
+    .save(&db)
+    .unwrap();
+    let st = state_with(db, None);
+
+    // 回显：webhook 打码、密钥只以"已配置"这一个比特露面（明文与残片都不给前端）。
+    let echo = st.alert_settings().await.unwrap();
+    assert!(echo.webhook.contains("***") && !echo.webhook.contains(TOKEN), "{echo:?}");
+    assert!(echo.secret_set && !echo.enabled);
+    assert_eq!(
+        echo.channels,
+        vec!["local"],
+        "开关没开 → 只有本地提醒中心在场（本地那条恒在）"
+    );
+
+    // ① 只翻开关：回显里的打码 webhook（= 保留库里那条）+ secret=None（= 保留原密钥）。
+    //    这是"用户只想开推送"的最常见动作 —— 若把空值/打码值当成新值写下去，
+    //    密钥就成了 `***`，之后每条推送 errcode 310000，而配置面上看不出任何毛病。
+    let saved = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: echo.webhook.clone(),
+            secret: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert!(saved.enabled && saved.secret_set, "翻开关不得动密钥：{saved:?}");
+    assert_eq!(saved.channels, vec!["local", "dingtalk"], "开关打开且 webhook 有值 → 钉钉进场");
+    let stored = stored_push_config(&st);
+    assert_eq!(stored.secret, SECRET, "库里还是原密钥");
+    assert_eq!(stored.webhook, webhook, "打码回显 = 保留库里的 webhook（不是把 *** 存下去）");
+
+    // ② 换 webhook（明文），密钥同时不动。
+    let new_webhook = format!("https://oapi.dingtalk.com/robot/send?access_token={TOKEN}2");
+    st.alert_settings_save(AlertSettingsIn {
+        webhook: new_webhook.clone(),
+        secret: None,
+        enabled: true,
+    })
+    .await
+    .unwrap();
+    let stored = stored_push_config(&st);
+    assert_eq!(stored.webhook, new_webhook, "明文 webhook 是新值");
+    assert_eq!(stored.secret, SECRET, "密钥一个字都没经过 UI 的手");
+
+    // ③ 显式清空（`Some("")`）：纯关键词模式的机器人是**合法配置**，与"没改"是两件事。
+    let saved = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: new_webhook.clone(),
+            secret: Some(String::new()),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert!(!saved.secret_set, "清掉之后回显要说「未配置」");
+    assert_eq!(stored_push_config(&st).secret, "", "显式清空要真的清掉");
+
+    // ④ 换新密钥。
+    let saved = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: new_webhook.clone(),
+            secret: Some(format!("{SECRET}2")),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert!(saved.secret_set);
+    assert_eq!(stored_push_config(&st).secret, format!("{SECRET}2"));
+
+    // ⑤ 打码值塞进 secret 一律拒绝（回显串回存就是"之后每条都 310000"的种子），
+    //    且拒绝时不得留下半份配置。
+    let before = stored_push_config(&st);
+    let err = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: new_webhook.clone(),
+            secret: Some("***".to_string()),
+            enabled: true,
+        })
+        .await
+        .expect_err("打码串不许进库");
+    assert!(err.contains("***"), "要说清拒绝的是什么：{err}");
+    assert_eq!(stored_push_config(&st), before, "拒绝写入不得留下半份配置");
+
+    // ⑥ 清空 webhook 框 = 摘掉那条通道（明文空串不是打码值，按新值写）：开关开着也不会有
+    //    钉钉通道 —— `channels()` 只在 webhook 填了时才装它。
+    let saved = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: String::new(),
+            secret: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.webhook, "", "空 webhook 回显也是空串");
+    assert_eq!(saved.channels, vec!["local"], "webhook 空着 → 钉钉不在场");
+}
+
+#[tokio::test]
+async fn sso_status_reports_not_linked_without_a_token() {
+    let st = state_sso(
+        Db::in_memory().unwrap(),
+        Arc::new(MemoryTokenStore::default()),
+        CharConfig::default(),
+    );
+    let s = st.sso_status().await.unwrap();
+    assert!(
+        !s.linked,
+        "凭据库读空 = 未挂链，不是错误（store 层刻意把四种读空形态收拢成 Ok(None)）"
+    );
+    assert!(s.char_id.is_none() && s.char_name.is_none());
+    assert!(s.expires_at.is_none() && !s.token_expired);
+    assert_eq!(s.last_sync_at, None, "没有角色 id 就没有可查的行键");
+    assert!(s.token_error.is_none());
+    // 没配 client_id 的默认态：这两条正是"为什么什么都不动"的答案。
+    assert!(!s.char_sync_enabled && !s.client_id_set);
+}
+
+#[tokio::test]
+async fn sso_status_reads_the_character_from_the_token_and_never_echoes_it() {
+    const CHAR: u64 = 90_000_001;
+    let db = Db::in_memory().unwrap();
+    db.upsert_char_meta(CHAR, "Pilot One", 1_789_000_000).unwrap();
+    let store = Arc::new(MemoryTokenStore::default());
+    let expires = now_unix() + 3600;
+    store.save(&fake_token(expires)).unwrap();
+    let st = state_sso(
+        db,
+        store.clone(),
+        CharConfig {
+            client_id: "test-client-id".into(),
+            enabled: true,
+            ..Default::default()
+        },
+    );
+
+    let s = st.sso_status().await.unwrap();
+    // 正向证据：身份确实是从**这个**令牌里解出来的（下面的"没有哨兵"才有意义）。
+    assert!(s.linked);
+    assert_eq!(s.char_id, Some(CHAR), "角色 id 取自令牌的 sub");
+    assert_eq!(s.char_name.as_deref(), Some("Pilot One"));
+    assert_eq!(s.expires_at, Some(expires));
+    assert!(!s.token_expired, "离过期还有一小时");
+    assert_eq!(s.last_sync_at, Some(1_789_000_000), "上次同步来自 char_meta");
+    assert!(s.char_sync_enabled && s.client_id_set);
+    assert!(s.token_error.is_none());
+
+    // 要害：整份状态序列化之后**令牌原文一个字都不在**（前端拿到的就是这个 JSON）。
+    let json = serde_json::to_string(&s).unwrap();
+    assert!(!json.contains(AT_SIG) && !json.contains(RT_SENTINEL), "令牌进状态了：{json}");
+    assert!(!json.contains("SENTINEL"), "{json}");
+
+    // 已过期：判定走 `TokenSet::is_expired`（提前 60 s 视为过期），TS 侧不复制那条边界。
+    store.save(&fake_token(now_unix() - 10)).unwrap();
+    assert!(st.sso_status().await.unwrap().token_expired);
+
+    // 异形令牌（换过序列化格式 / 凭据被手工改过）：如实报"取不出角色"，不报错、不猜 id，
+    // 也不把令牌原文带进错误串（`sso::flow` 的报错只带 JWT 段数与字段名）。
+    store
+        .save(&TokenSet {
+            access_token: format!("not-a-jwt-{AT_SIG}"),
+            refresh_token: RT_SENTINEL.to_string(),
+            expires_at: expires,
+        })
+        .unwrap();
+    let s = st.sso_status().await.unwrap();
+    assert!(!s.linked && s.char_id.is_none(), "解不出角色就不算挂链（那种状态同步会整轮失败）");
+    let err = s.token_error.clone().expect("要说清为什么取不出角色");
+    assert!(err.contains("段"), "报错要能读懂（JWT 段数）：{err}");
+    assert!(!err.contains("SENTINEL"), "报错串带了令牌原文：{err}");
+    assert!(!serde_json::to_string(&s).unwrap().contains("SENTINEL"), "{s:?}");
+}
+
+#[tokio::test]
+async fn sso_logout_clears_the_token_store_and_is_idempotent() {
+    let store = Arc::new(MemoryTokenStore::default());
+    store.save(&fake_token(now_unix() + 3600)).unwrap();
+    let st = state_sso(Db::in_memory().unwrap(), store.clone(), CharConfig::default());
+    assert!(st.sso_status().await.unwrap().linked);
+
+    st.sso_logout().await.unwrap();
+    assert!(store.load().unwrap().is_none(), "登出必须清掉凭据库里的令牌");
+    let s = st.sso_status().await.unwrap();
+    assert!(!s.linked && s.expires_at.is_none(), "登出后状态要如实变成未挂链");
+
+    // 幂等：本来没登录时再点一次不该报错（`TokenStore::clear` 的契约）。
+    st.sso_logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn sso_login_fails_fast_without_a_client_id() {
+    // 没配 client_id 时授权页必然报错：让用户点一次浏览器、白等满 180 秒超时，
+    // 再从那句"没反应"里猜是配置没填 —— 所以这里必须当场拒绝并给出可照着做的话。
+    // 本测试不打网络、不开浏览器（`login` 根本不会被调用）。
+    let st = state_sso(
+        Db::in_memory().unwrap(),
+        Arc::new(MemoryTokenStore::default()),
+        CharConfig::default(),
+    );
+    let err = st.sso_login().await.expect_err("没配 client_id 必须当场拒绝");
+    assert!(err.contains("EMD_CHAR_CLIENT_ID"), "要说清去改哪个键：{err}");
 }

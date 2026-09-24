@@ -70,12 +70,15 @@ export default function TopBar() {
         </span>
       )}
 
-      <span className="viewswitch" title="市场 = 三栏浏览；倒卖 = 全宽扫描器">
+      <span className="viewswitch" title="市场 = 三栏浏览；倒卖 = 全宽扫描器；提醒 = 告警与推送配置">
         <button className={view === "market" ? "on" : ""} onClick={() => setView("market")}>
           市场
         </button>
         <button className={view === "flip" ? "on" : ""} onClick={() => setView("flip")}>
           倒卖
+        </button>
+        <button className={view === "alerts" ? "on" : ""} onClick={() => setView("alerts")}>
+          提醒
         </button>
       </span>
 

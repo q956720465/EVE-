@@ -1,12 +1,12 @@
 import { create } from "zustand";
 import { api } from "./api";
-import type { AppStatus, FlipParams, FlipScan, FlipSortKey, Hub, ListingRow, TrialOut, TreeNode, TypeDetail } from "./types";
+import type { AlertRow, AlertSettings, AlertSettingsIn, AppStatus, FlipParams, FlipScan, FlipSortKey, Hub, ListingRow, SsoStatus, TrialOut, TreeNode, TypeDetail } from "./types";
 
 /** 吉他。主视图默认站点，切换枢纽时改这里。 */
 export const JITA = 60003760;
 
-/** 顶层视图：市场浏览（三栏）与倒卖扫描（全宽）。 */
-export type View = "market" | "flip";
+/** 顶层视图：市场浏览（三栏）、倒卖扫描（全宽）、提醒中心（全宽）。 */
+export type View = "market" | "flip" | "alerts";
 
 interface State {
   tree: TreeNode[];
@@ -32,6 +32,13 @@ interface State {
   flipBusy: boolean;
   trial: TrialOut | null;
 
+  /** 提醒中心（M4c）。alerts 为 null = 还没拉过；空数组是"真没有告警"（两者不能混）。 */
+  alerts: AlertRow[] | null;
+  alertsBusy: boolean;
+  settings: AlertSettings | null;
+  sso: SsoStatus | null;
+  ssoBusy: boolean;
+
   boot(): Promise<void>;
   toggle(categoryId: number): void;
   selectGroup(groupId: number, name: string): Promise<void>;
@@ -45,6 +52,13 @@ interface State {
   saveFlipParams(p: FlipParams): Promise<boolean>;
   setFlipSort(k: FlipSortKey): void;
   runTrial(buy: number, sell: number, qty: number): Promise<void>;
+  loadAlerts(): Promise<void>;
+  loadSettings(): Promise<void>;
+  /** 同 `saveFlipParams` 的纪律：返回 false 时调用方必须保留 dirty 与用户输入。 */
+  saveSettings(input: AlertSettingsIn): Promise<boolean>;
+  loadSso(): Promise<void>;
+  loginSso(): Promise<void>;
+  logoutSso(): Promise<void>;
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -69,6 +83,12 @@ export const useStore = create<State>((set, get) => ({
   flipSort: "score",
   flipBusy: false,
   trial: null,
+
+  alerts: null,
+  alertsBusy: false,
+  settings: null,
+  sso: null,
+  ssoBusy: false,
 
   async boot() {
     set({ busy: true, error: null });
@@ -154,7 +174,13 @@ export const useStore = create<State>((set, get) => ({
 
   setView(view) {
     set({ view });
+    // 三个视图各自懒加载：进来才拉，之后切走再切回不重复拉（重载按钮负责刷新）。
     if (view === "flip" && get().flip === null) void get().loadFlip();
+    if (view === "alerts") {
+      if (get().alerts === null) void get().loadAlerts();
+      if (get().settings === null) void get().loadSettings();
+      if (get().sso === null) void get().loadSso();
+    }
   },
 
   async loadFlip() {
@@ -188,6 +214,71 @@ export const useStore = create<State>((set, get) => ({
       set({ trial: await api.trialCalc(buy, sell, qty) });
     } catch (e) {
       set({ trial: null, error: String(e) });
+    }
+  },
+
+  async loadAlerts() {
+    set({ alertsBusy: true });
+    try {
+      // 拉到空数组也是"拉过了"：null 与 [] 必须分开，否则每次切回这个视图都重拉一遍。
+      set({ alerts: await api.alertsList(), alertsBusy: false });
+    } catch (e) {
+      set({ alertsBusy: false, error: String(e) });
+    }
+  },
+
+  async loadSettings() {
+    try {
+      set({ settings: await api.alertSettingsGet() });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  async saveSettings(input) {
+    try {
+      // 用后端回显刷新面板：它才是"库里现在是什么"的真相（用户输入里的打码 webhook
+      // 与库里的真值不是一回事，拿输入自己拼会把两件事混起来）。
+      set({ settings: await api.alertSettingsSet(input) });
+      return true;
+    } catch (e) {
+      // 同 saveFlipParams：不能吞掉错误后假装成功，调用方要靠返回值决定是否清 dirty。
+      set({ error: String(e) });
+      return false;
+    }
+  },
+
+  async loadSso() {
+    try {
+      set({ sso: await api.ssoStatus() });
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  async loginSso() {
+    set({ ssoBusy: true });
+    try {
+      await api.ssoLogin();
+    } catch (e) {
+      set({ error: String(e) });
+    } finally {
+      // 无论成败都回读一次状态：状态是后端算的（角色名/到期/上次同步都在那条命令里），
+      // 拿回执自己拼一份就会有两套口径；失败时也顺便让面板回到"库里的真实状态"。
+      set({ ssoBusy: false });
+      await get().loadSso();
+    }
+  },
+
+  async logoutSso() {
+    set({ ssoBusy: true });
+    try {
+      await api.ssoLogout();
+    } catch (e) {
+      set({ error: String(e) });
+    } finally {
+      set({ ssoBusy: false });
+      await get().loadSso();
     }
   },
 }));

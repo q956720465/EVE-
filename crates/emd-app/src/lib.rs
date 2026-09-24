@@ -9,18 +9,24 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use emd_core::catalog;
 use emd_core::collector::InstanceLock;
-use emd_core::config::EsiConfig;
+use emd_core::config::{CharConfig, EsiConfig};
 use emd_core::esi::EsiClient;
 use emd_core::market::STATION_JITA;
-use emd_core::scheduler::{RoundState, Scheduler, SchedulerConfig, MIN_INTERVAL};
-use emd_core::store::{Db, HistoryBar, ListingRow, TreeNode, TypeBook};
+use emd_core::push::{PushConfig, PushConfigEcho};
+use emd_core::scheduler::{
+    RoundState, Scheduler, SchedulerConfig, KEYRING_ACCOUNT, KEYRING_SERVICE, MIN_INTERVAL,
+};
+use emd_core::sso::flow::{char_from_access_token, login};
+use emd_core::sso::store::{KeyringTokenStore, TokenStore};
+use emd_core::sso::token::TokenSet;
+use emd_core::store::{now_unix, Db, HistoryBar, ListingRow, TreeNode, TypeBook};
 use emd_core::tree;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{RunEvent, State};
 use tokio::sync::watch;
 
@@ -126,6 +132,105 @@ pub struct StatusOut {
     pub collecting: bool,
 }
 
+/// 提醒中心的一行（M4c）。列表用扁平 DTO，但**payload 原文一并带上** —— 口径摘要由前端从
+/// 它里面读（`AlertPayload` 是推送卡片与提醒中心的唯一序列化出口，spec §4.4），这一层不另造
+/// 第二份结构。名字（类型/站点）是**回填**的当前字典值，查不到用 fallback 串
+/// （`type_id N` / `站点 #N`，与 `flip_scan` 同一套字面量）：名字缺失不该杀掉一张告警。
+#[derive(Debug, Serialize)]
+pub struct AlertRow {
+    /// 去重键 `order:{id}` / `tx:{id}`（**TEXT**，原样透传）：用户拿它去库里检索那张单/那笔成交，
+    /// 已实现轨的成交 id 只存在于这个串里（`AlertRecord` 没有单列它）。
+    pub alert_key: String,
+    /// 形态串（`AlertKind::as_str`）：expected_sell_loss / buy_order_trap / realized_loss。
+    pub kind: &'static str,
+    pub char_id: u64,
+    pub type_id: u32,
+    pub type_name: String,
+    pub location_id: u64,
+    pub location_name: String,
+    /// 订单方向：true = 买单。
+    pub is_buy: bool,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    /// 本轮观测到的亏损额（正数 ISK）。**不是** `notified_*` 那一组（那组记的是推送史）。
+    pub last_loss_isk: f64,
+    /// 本轮观测到的亏损率（%，负 = 亏）。
+    pub last_margin_pct: f64,
+    /// 状态串（`AlertState::as_str`）：new / notified / cleared。
+    pub state: &'static str,
+    pub notified_at: Option<i64>,
+    pub notified_day: Option<String>,
+    /// 本条目**今天**被推送的条数（当日全局用量是各条目之和，spec §4.4）。
+    pub notified_count_day: u32,
+    /// 上次推送时的**亏损率**（百分点）。列名叫 `last_notified_loss`，口径不是金额 ——
+    /// 穿透判定比的是"再低 2pp"（`ALERT_DEEPEN_PP`），存 ISK 就没有 pp 可比。名字里不要 isk。
+    pub last_notified_margin_pct: Option<f64>,
+    /// `AlertPayload` 的 JSON 文本（`alerts.payload` 列原样）。前端从它里面读口径摘要。
+    pub payload: String,
+}
+
+/// 通道配置的回显（`alert_settings_get` / `alert_settings_set` 的返回值）。
+///
+/// **密钥只有"是否已配置"一个比特**：明文与打码残片都不给前端（A4），要改密钥只能走
+/// `AlertSettingsIn.secret` 的三态。
+#[derive(Debug, Serialize)]
+pub struct AlertSettings {
+    /// 已中段打码的 webhook；空串 = 没配。**它同时是"没改"的载体**：原样回存 =
+    /// `save_editing` 保留库里那条（打码串不携带信息，存下去只会把 `***` 写进库）。
+    pub webhook: String,
+    pub secret_set: bool,
+    pub enabled: bool,
+    /// 本轮真的会装上的通道名（`local` 恒在；`dingtalk` 只在开关打开且 webhook 填了时在场）。
+    /// 让"开关开着但 webhook 还空着"这种"看起来配好了其实不发"的形态一眼可见。
+    pub channels: Vec<&'static str>,
+}
+
+/// `alert_settings_set` 的入参 DTO。**为什么在命令层自己定义一个**：`PushConfigEcho` 有意只实现
+/// `Serialize`（A4：前端不能把打了码的值喂回来），所以入参形状归这一层。
+///
+/// `secret` 的三态**不是装饰**（T11 的坑）：`None` = 用户没动密钥框（保留原密钥）、
+/// `Some("")` = 显式清空（改用纯关键词模式）、`Some(s)` = 换新密钥。把空串当成"没改"会让
+/// "只翻个开关"顺手把已配的签名密钥清掉 → 钉钉 errcode 310000 → 通道被禁用，报错话术还会
+/// 去怪机器人（那时配置面上看不出任何毛病）。
+#[derive(Deserialize)]
+pub struct AlertSettingsIn {
+    pub webhook: String,
+    pub secret: Option<String>,
+    pub enabled: bool,
+}
+
+/// SSO 挂链状态（`sso_status`）。**只回派生的布尔/时刻/身份，令牌原文一个字都不在里面**
+/// （Global Constraints）—— 角色 id 与名字是从令牌自己解出来的，不是从库里"猜"的。
+/// `Debug` 是安全的：能被 `{:?}` 打出来的字段本身就不含令牌（这也是本类型的契约）。
+#[derive(Debug, Serialize)]
+pub struct SsoStatus {
+    /// 令牌在**且**能解出角色 = 调度器真能同步。令牌在但解不出（异形/换过格式）时也是 false：
+    /// 那种状态同步会整轮失败，界面不该显示"已挂链"。
+    pub linked: bool,
+    pub char_id: Option<u64>,
+    pub char_name: Option<String>,
+    /// 库内 `char_meta.last_sync_at`（角色 id 由令牌给出，库里没有"列出所有角色"的查询）。
+    pub last_sync_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    /// 由 `TokenSet::is_expired` 判（提前 60 s 视为过期）—— 判定只此一处，TS 不复制那条边界。
+    pub token_expired: bool,
+    /// 角色同步开关（`CharConfig.enabled`）：false 时**每个采集轮都静默跳过同步**，
+    /// 界面必须把这条说出来，否则用户只能看到"零告警"。
+    pub char_sync_enabled: bool,
+    /// `client_id` 是否配了（`EMD_CHAR_CLIENT_ID`）。没配时登录按钮要给出可照着做的下一步。
+    pub client_id_set: bool,
+    /// 令牌在、但解不出角色时的原因（一句能照着查的话；**不含令牌原文** ——
+    /// `char_from_access_token` 的报错只带 JWT 段数与字段名）。
+    pub token_error: Option<String>,
+}
+
+/// 登录成功的回执。**不含令牌**：令牌只落系统凭据库（`TokenStore::save`）与进程内存。
+#[derive(Debug, Serialize)]
+pub struct SsoLoginOut {
+    pub char_id: u64,
+    pub name: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     db: DbRef,
@@ -136,6 +241,13 @@ struct AppState {
     /// 网络请求"两处判断都读它 —— 用"收过状态广播"反推会把冷启动建树的
     /// ~80 秒误标成只读，而那时本进程正在满负荷打 ESI。
     collector: Arc<AtomicBool>,
+    /// 令牌来源（M4c）。默认系统凭据库；测试注入内存实现。`sso_status`/`sso_logout`/`sso_login`
+    /// 三个命令都只经它读写令牌 —— 这条通路上**没有**任何令牌的落库/日志面。
+    tokens: Arc<dyn TokenStore>,
+    /// SSO 与角色同步配置（`CharConfig::from_env()` 归一的那一份）。`sso_login` 的四个参数
+    /// 全部从这里取：`client_id` 与 `redirect_uri` 必须与开发者后台的注册值逐字符一致，
+    /// 不能由代码代猜（EVE 是精确匹配）。
+    cfg: CharConfig,
 }
 
 /// 命令体都放这里，`#[tauri::command]` 只做参数拆装。
@@ -411,6 +523,182 @@ impl AppState {
             None => Ok("还没有任何一轮，稍候会自动开始".into()),
         }
     }
+
+    // ---- M4c：提醒中心（T14） ------------------------------------------------
+
+    /// 凭据库读是阻塞的（Windows 凭据管理器是一次进程间调用），与读库同一待遇：
+    /// 丢进 blocking 池，别占住 WebView 的 IPC 线程。
+    async fn tokens_load(&self) -> Result<Option<TokenSet>, String> {
+        let store = self.tokens.clone();
+        tokio::task::spawn_blocking(move || store.load().map_err(err))
+            .await
+            .map_err(|e| format!("凭据库读取线程异常退出：{e}"))?
+    }
+
+    /// 提醒中心列表。全表读回（**含 `Cleared`**）：闸门只管推不推、从不删行，
+    /// "这个周期亏过、后来撤单了"本身就是用户要知道的事实（spec §4.4）。
+    async fn alerts_list(&self) -> Result<Vec<AlertRow>, String> {
+        read(self.db.clone(), |db| {
+            let recs = db.load_alerts().map_err(err)?;
+            let mut out = Vec::with_capacity(recs.len());
+            for r in recs {
+                // 名字回填走单条查询，失败不报错（用 fallback 串）—— 名字缺失不该杀掉一行告警。
+                let type_name = db
+                    .type_name(r.type_id)
+                    .map_err(err)?
+                    .unwrap_or_else(|| format!("type_id {}", r.type_id));
+                let location_name = db
+                    .station_name(r.location_id)
+                    .map_err(err)?
+                    .unwrap_or_else(|| format!("站点 #{}", r.location_id));
+                out.push(AlertRow {
+                    alert_key: r.alert_key,
+                    kind: r.kind.as_str(),
+                    char_id: r.char_id,
+                    type_id: r.type_id,
+                    type_name,
+                    location_id: r.location_id,
+                    location_name,
+                    is_buy: r.is_buy,
+                    first_seen_at: r.first_seen_at,
+                    last_seen_at: r.last_seen_at,
+                    last_loss_isk: r.last_loss_isk,
+                    last_margin_pct: r.last_margin_pct,
+                    state: r.state.as_str(),
+                    notified_at: r.notified_at,
+                    notified_day: r.notified_day,
+                    notified_count_day: r.notified_count_day,
+                    last_notified_margin_pct: r.last_notified_loss,
+                    payload: r.payload,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// 通道配置的回显（三个旋钮 + 本轮真会装上的通道名）。
+    /// **只走 `echo()`**：`PushConfig::load` 的明文只给发送器与保存路径用（A4）。
+    async fn alert_settings(&self) -> Result<AlertSettings, String> {
+        read(self.db.clone(), |db| {
+            let cfg = PushConfig::load(db).map_err(err)?;
+            Ok(settings_of(&cfg))
+        })
+        .await
+    }
+
+    /// 改通道配置。写路径只有 `PushConfig::save_editing` 一条（它是唯一能在**不需要密钥明文**
+    /// 的前提下改配置的入口），保存成功后回一份新的打码回显 —— 面板据此刷新，
+    /// 而不是拿用户输入自己拼（输入里的打码 webhook 与库里的真值不是一回事）。
+    async fn alert_settings_save(&self, input: AlertSettingsIn) -> Result<AlertSettings, String> {
+        read(self.db.clone(), move |db| {
+            let echo = PushConfigEcho {
+                // 打码串由 `save_editing` 解读为"保留库里那条"；明文则是新值。
+                webhook: input.webhook,
+                // `save_editing` 不看这个字段（密钥只走 `new_secret`，它才带得起三态），
+                // 填什么都不会进库 —— 占位而已。
+                secret_set: false,
+                enabled: input.enabled,
+            };
+            PushConfig::save_editing(db, &echo, input.secret.as_deref()).map_err(err)?;
+            let saved = PushConfig::load(db).map_err(err)?;
+            Ok(settings_of(&saved))
+        })
+        .await
+    }
+
+    /// SSO 挂链状态。**派生事实进、派生事实出**：令牌只以"链没链上 / 到期时刻 / 从它解出的
+    /// 角色身份"三种形态露面，原文一个字都不回前端。
+    ///
+    /// 读不到令牌**不算错误**：`TokenStore::load` 的 `Ok(None)` 已经把"没登录 / 已登出 /
+    /// 凭据库不可用 / 凭据内容坏了"四种情形收拢成同一件事（store 层刻意如此），
+    /// 这里照它的口径如实报"未挂链"即可 —— 报错会让整块面板消失，用户连登录按钮都摸不到。
+    async fn sso_status(&self) -> Result<SsoStatus, String> {
+        let token = self.tokens_load().await?;
+
+        // 角色身份从**令牌自己**里解（与调度器同一判据，`char_from_access_token` 只解码不验签）。
+        // 绝不拿库里 `char_meta` 的行反推"现在挂链的是谁"：那可能是上一个角色留下的行，
+        // 而同步请求的路径与缓存键正是这个角色 id —— 指错人就是拿 A 的令牌去拉 B 的数据。
+        let (char_id, char_name, token_error) = match token.as_ref() {
+            None => (None, None, None),
+            Some(t) => match char_from_access_token(&t.access_token) {
+                Ok((id, name)) => (Some(id), Some(name), None),
+                // 报错只带 JWT 段数与字段名，令牌原文不参与（见 `sso::flow` 的实现）。
+                Err(e) => (None, None, Some(e.to_string())),
+            },
+        };
+
+        let last_sync_at = match char_id {
+            Some(id) => {
+                read(self.db.clone(), move |db| {
+                    Ok(db.char_meta(id).map_err(err)?.and_then(|m| m.last_sync_at))
+                })
+                .await?
+            }
+            // 没有角色 id 就没有可查的行键（库里没有"列出所有角色"的查询，见函数头）。
+            None => None,
+        };
+
+        let now = now_unix();
+        Ok(SsoStatus {
+            linked: char_id.is_some(),
+            char_id,
+            char_name,
+            last_sync_at,
+            expires_at: token.as_ref().map(|t| t.expires_at),
+            token_expired: token.as_ref().map(|t| t.is_expired(now)).unwrap_or(false),
+            char_sync_enabled: self.cfg.enabled,
+            client_id_set: !self.cfg.client_id.trim().is_empty(),
+            token_error,
+        })
+    }
+
+    /// 退出登录：清系统凭据库里的令牌。**库内角色数据与告警表一行不动** ——
+    /// 退出是"不用这个角色了"，不是"删掉历史"。`clear()` 本身幂等，没登录时再点一次也不报错。
+    async fn sso_logout(&self) -> Result<(), String> {
+        let store = self.tokens.clone();
+        tokio::task::spawn_blocking(move || store.clear().map_err(err))
+            .await
+            .map_err(|e| format!("凭据库清除线程异常退出：{e}"))?
+    }
+
+    /// 发起 SSO 登录（T3B 的编排：起回环 → 开系统浏览器 → 收 code → 换令牌 → 落凭据库）。
+    ///
+    /// **没配 `client_id` 就当场拒绝**：授权页会把 `client_id` 带在查询串里，空值打开的是一个
+    /// 必然报错的页面 —— 用户点一次浏览器、等满 180 秒超时，才从"没反应"里猜出是配置没填。
+    /// 这里直接把可照着做的那句话给出来。
+    async fn sso_login(&self) -> Result<SsoLoginOut, String> {
+        if self.cfg.client_id.trim().is_empty() {
+            return Err(
+                "先在设置里配 EMD_CHAR_CLIENT_ID / client_id —— 没有它授权页打不开（开发者后台注册应用后取）"
+                    .into(),
+            );
+        }
+        // 四个参数全部来自配置：`redirect_uri` 与端口必须逐字符等于开发者后台的注册值，
+        // 由用户配、代码不代猜。超时 180 s 是"用户手点授权"的合理上限。
+        let out = login(
+            &self.cfg.client_id,
+            &self.cfg.redirect_uri,
+            self.cfg.loopback_port,
+            self.tokens.as_ref(),
+            Duration::from_secs(180),
+        )
+        .await
+        .map_err(err)?;
+        Ok(SsoLoginOut { char_id: out.char_id, name: out.name })
+    }
+}
+
+/// `PushConfig` → 面板回显（`echo()` 打码 + 本轮真会装上的通道名）。
+/// 抽成一处是为了让"回显"只有一条路径：`load()` 的明文永远不往前端走。
+fn settings_of(cfg: &PushConfig) -> AlertSettings {
+    let echo = cfg.echo();
+    AlertSettings {
+        webhook: echo.webhook,
+        secret_set: echo.secret_set,
+        enabled: echo.enabled,
+        channels: cfg.channels().iter().map(|c| c.name()).collect(),
+    }
 }
 
 #[tauri::command]
@@ -507,6 +795,41 @@ async fn trial_calc(
 #[tauri::command]
 async fn request_refresh(state: State<'_, AppState>) -> Result<String, String> {
     state.refresh_hint().await
+}
+
+#[tauri::command]
+async fn alerts_list(state: State<'_, AppState>) -> Result<Vec<AlertRow>, String> {
+    state.alerts_list().await
+}
+
+#[tauri::command]
+async fn alert_settings_get(state: State<'_, AppState>) -> Result<AlertSettings, String> {
+    state.alert_settings().await
+}
+
+#[tauri::command]
+async fn alert_settings_set(
+    state: State<'_, AppState>,
+    input: AlertSettingsIn,
+) -> Result<AlertSettings, String> {
+    state.alert_settings_save(input).await
+}
+
+#[tauri::command]
+async fn sso_status(state: State<'_, AppState>) -> Result<SsoStatus, String> {
+    state.sso_status().await
+}
+
+#[tauri::command]
+async fn sso_logout(state: State<'_, AppState>) -> Result<(), String> {
+    state.sso_logout().await
+}
+
+/// 登录会开系统浏览器并等回调（最长 180 s）：命令是 async 的，等待期不阻塞界面。
+/// 回环等待在 `login` 内部已经挪进 `spawn_blocking`，所以在 Tauri 的 async 执行器上安全。
+#[tauri::command]
+async fn sso_login(state: State<'_, AppState>) -> Result<SsoLoginOut, String> {
+    state.sso_login().await
 }
 
 fn db_path() -> PathBuf {
@@ -607,7 +930,19 @@ async fn collect_with_lock(
     };
     collector.store(true, Ordering::Relaxed);
 
-    let sched = Scheduler::new(client.clone(), db.clone(), SchedulerConfig::default());
+    // `SchedulerConfig::default()` 的 char 侧是**关闭**的（`CharConfig::default().enabled = false`）：
+    // 用它的话，用户登录成功之后每一轮都静默跳过同步 —— 一条日志都不解释，界面上只剩"永远零告警"。
+    // 这里必须走 `from_env()`（与 daemon 的 `alerts --update` 同一份归一：EMD_CHAR_CLIENT_ID /
+    // EMD_CHAR_SYNC）。令牌源指向与登录/登出**同一对** keyring 条目：两个常量只在
+    // `emd_core::scheduler` 定义一次 —— 条目对不上时表现为"登录成功但每轮静默跳过"，
+    // 而"没令牌"不是错误，从现象上完全看不出是条目没对上。`KeyringTokenStore` 是无状态句柄
+    // （不带缓存），与界面侧那份指向同一条条目，读写的是同一份令牌。
+    let sched = Scheduler::new(
+        client.clone(),
+        db.clone(),
+        SchedulerConfig { char: CharConfig::from_env(), ..Default::default() },
+    )
+    .with_tokens(Arc::new(KeyringTokenStore::new(KEYRING_SERVICE, KEYRING_ACCOUNT)));
 
     // 冷启动补树：分类字典不来自订单簿，只建一次就长期有效。
     // 放在首轮之前是有意的 —— 两条 future 共用同一条 Connection 时，
@@ -699,6 +1034,11 @@ pub fn run() {
         latest: Arc::new(Mutex::new(None)),
         shutdown: stop_tx,
         collector: Arc::new(AtomicBool::new(false)),
+        // 界面侧的令牌源与采集线程那份指向同一对 keyring 条目（常量共用一处定义）。
+        tokens: Arc::new(KeyringTokenStore::new(KEYRING_SERVICE, KEYRING_ACCOUNT)),
+        // `from_env()` 只在这里读一次：`sso_login` 的 client_id/redirect_uri/端口都取自它，
+        // 运行期不随环境变量再变（与 `EsiConfig::from_env()` 同一先例）。
+        cfg: CharConfig::from_env(),
     };
 
     spawn_collector(
@@ -728,7 +1068,13 @@ pub fn run() {
             get_flip_params,
             set_flip_params,
             trial_calc,
-            request_refresh
+            request_refresh,
+            alerts_list,
+            alert_settings_get,
+            alert_settings_set,
+            sso_status,
+            sso_logout,
+            sso_login
         ])
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")

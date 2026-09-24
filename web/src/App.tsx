@@ -6,6 +6,7 @@ import CatalogTree from "./components/CatalogTree";
 import TypeTable from "./components/TypeTable";
 import OrderBook from "./components/OrderBook";
 import FlipScanner from "./components/FlipScanner";
+import AlertCenter from "./components/AlertCenter";
 import { fmtDur } from "./format";
 
 export default function App() {
@@ -19,6 +20,7 @@ export default function App() {
   const groupName = useStore((s) => s.groupName);
   const view = useStore((s) => s.view);
   const flip = useStore((s) => s.flip);
+  const alerts = useStore((s) => s.alerts);
 
   useEffect(() => {
     void boot();
@@ -32,6 +34,10 @@ export default function App() {
       {view === "flip" ? (
         <div className="panes one">
           <FlipScanner />
+        </div>
+      ) : view === "alerts" ? (
+        <div className="panes one">
+          <AlertCenter />
         </div>
       ) : (
         <div className="panes">
@@ -65,6 +71,10 @@ export default function App() {
         {view === "flip" ? (
           <span>
             {(flip?.rows.length ?? 0).toLocaleString()} 条机会 · 倒卖扫描
+          </span>
+        ) : view === "alerts" ? (
+          <span>
+            {alerts === null ? "告警表读取中…" : `${alerts.length.toLocaleString()} 条告警 · 提醒中心`}
           </span>
         ) : query.trim().length >= 2 ? (
           <span>{searchResults.length} 行 · 搜索中</span>

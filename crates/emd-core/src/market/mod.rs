@@ -35,3 +35,9 @@ pub const HUB_REGIONS: [(&str, u32); 4] = [
     ("Metropolis", 10000042),
     ("Heimatar", 10000030),
 ];
+
+/// 跨区单簿读取年龄闸门：45 min ≈ 3–4 个 T1.5 周期。
+/// 上批数据可用，但过期数据必须消失，否则会拿 45 分钟前的价格继续配对（诚实口径）。
+pub const XREGION_MAX_AGE_SECS: i64 = 45 * 60;
+/// 跨区旧行剪除线（表有界的最后一道保险）。
+pub const XREGION_PRUNE_SECS: i64 = 24 * 3600;

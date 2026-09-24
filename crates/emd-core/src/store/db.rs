@@ -107,6 +107,21 @@ pub struct RoundRecord {
     pub status: String,
 }
 
+/// `xregion_log` 的一行。每趟 T1.5 记一条，与 round_log 同纪律：
+/// 只追加台账，不落行级数据。表有界由 24h 剪除保证。
+#[derive(Debug, Clone)]
+pub struct XRegionLog {
+    pub started_at: i64,
+    pub types: i64,
+    pub regions: i64,
+    pub requests: i64,
+    pub orders: i64,
+    pub books_written: i64,
+    pub failed: i64,
+    pub seconds: f64,
+    pub status: String,
+}
+
 /// 吉他视图需要的行。深度仍是 JSON 文本，由前端解析 —— 避免在 Rust 侧
 /// 为每个类型构造完整阶梯再跨 IPC 复制一遍。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -498,10 +513,17 @@ impl Db {
         }
     }
 
-    /// 当前快照的全部单簿 → `StationOrderBook`（flip 扫描的输入装配）。
-    /// station_orders 存的是聚合结果，这里反读：depth JSON 反序列化，
-    /// `skipped_*`/`is_npc` 原样带回（UI 展示用）。
+    /// 当前快照的全部单簿（Forge 全量 ∪ T1.5 跨区窗口内行）——flip 扫描的输入装配。
+    /// 跨区行按 `XREGION_MAX_AGE_SECS` 年龄闸门过滤：上批数据可用，但过期数据
+    /// 必须消失，否则会拿 45 分钟前的价格继续配对（诚实口径）。
     pub fn load_books(&self) -> Result<Vec<StationOrderBook>> {
+        let mut books = self.load_station_books()?;
+        books.extend(self.load_xregion_books(now_unix() - crate::market::XREGION_MAX_AGE_SECS)?);
+        Ok(books)
+    }
+
+    /// 仅 station_orders（不含 T1.5 跨区行）。测试与运维核对基线快照用它。
+    pub fn load_station_books(&self) -> Result<Vec<StationOrderBook>> {
         let mut stmt = self.conn.prepare(
             "SELECT location_id, type_id, is_npc, best_bid, bid_qty, best_ask, ask_qty,
                     bid_levels, ask_levels, bid_depth, ask_depth,
@@ -1344,6 +1366,272 @@ impl Db {
             .optional()?
             .flatten())
     }
+
+    // ---- M4b：生命周期与跨区单簿 -------------------------------------------
+
+    /// 保存或更新一行机会生命周期记录。三维主键 `(type_id, buy_loc, sell_loc)`
+    /// 即 opportunity_key：字段本身稳定、可读、可查，不用哈希。
+    /// `first_seen_at` 故意不参与 UPSERT 更新——它记录的是这条机会**首次登记**的时刻。
+    pub fn save_opp(&self, r: &crate::market::lifecycle::OppRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO opportunities (
+                type_id, buy_loc, sell_loc, state, miss_streak, first_seen_at, last_seen_at,
+                best_margin_pct, last_margin_pct, last_net_total, last_qty,
+                notified_at, notified_day, notified_count_day, last_notified_margin_pct)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(type_id, buy_loc, sell_loc) DO UPDATE SET
+               state=excluded.state, miss_streak=excluded.miss_streak,
+               last_seen_at=excluded.last_seen_at,
+               best_margin_pct=excluded.best_margin_pct, last_margin_pct=excluded.last_margin_pct,
+               last_net_total=excluded.last_net_total, last_qty=excluded.last_qty,
+               notified_at=excluded.notified_at, notified_day=excluded.notified_day,
+               notified_count_day=excluded.notified_count_day,
+               last_notified_margin_pct=excluded.last_notified_margin_pct",
+            params![
+                r.type_id,
+                r.buy_loc as i64,
+                r.sell_loc as i64,
+                r.state.as_str(),
+                r.miss_streak,
+                r.first_seen_at,
+                r.last_seen_at,
+                r.best_margin_pct,
+                r.last_margin_pct,
+                r.last_net_total,
+                r.last_qty as i64,
+                r.notified_at,
+                r.notified_day,
+                r.notified_count_day,
+                r.last_notified_margin_pct,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 未知 state 字符串行跳过并 warn——库被外部改坏时宁可少几行，
+    /// 也不能让整表读失败把扫描器打崩。
+    pub fn load_opps(&self) -> Result<Vec<crate::market::lifecycle::OppRecord>> {
+        use crate::market::lifecycle::{OppRecord, OppState};
+        let mut stmt = self.conn.prepare(
+            "SELECT type_id, buy_loc, sell_loc, state, miss_streak, first_seen_at, last_seen_at,
+                    best_margin_pct, last_margin_pct, last_net_total, last_qty,
+                    notified_at, notified_day, notified_count_day, last_notified_margin_pct
+             FROM opportunities ORDER BY type_id, buy_loc, sell_loc",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let state_raw: String = r.get(3)?;
+            Ok((
+                state_raw.clone(),
+                OppRecord {
+                    type_id: r.get::<_, i64>(0)? as u32,
+                    buy_loc: r.get::<_, i64>(1)? as u64,
+                    sell_loc: r.get::<_, i64>(2)? as u64,
+                    state: OppState::parse(&state_raw).unwrap_or(OppState::New),
+                    miss_streak: r.get(4)?,
+                    first_seen_at: r.get(5)?,
+                    last_seen_at: r.get(6)?,
+                    best_margin_pct: r.get(7)?,
+                    last_margin_pct: r.get(8)?,
+                    last_net_total: r.get(9)?,
+                    last_qty: r.get::<_, i64>(10)? as u64,
+                    notified_at: r.get(11)?,
+                    notified_day: r.get(12)?,
+                    notified_count_day: r.get(13)?,
+                    last_notified_margin_pct: r.get(14)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (raw, rec) = row?;
+            if OppState::parse(&raw).is_none() {
+                tracing::warn!(state = %raw, type_id = rec.type_id, "未知机会状态，跳过该行");
+                continue;
+            }
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// 只剪终态（expired / invalidated）且 last_seen_at 早于 before_ts 的行。
+    /// 活跃态永远留在表里，即使它很老——那是"还在观察"的事实。
+    pub fn prune_opps_terminal(&self, before_ts: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM opportunities WHERE state IN ('expired','invalidated') AND last_seen_at < ?1",
+            params![before_ts],
+        )?)
+    }
+
+    /// 本批 (hub, fetched_types) 的整批替换：先删这些 (站,类型) 的旧行再插新书。
+    /// 取到了但聚合为空（薄档）= 旧行必须删——否则陈旧盘口会继续参与配对。
+    pub fn write_xregion_books(
+        &self,
+        hub: u64,
+        region: u32,
+        fetched_types: &[u32],
+        books: &[StationOrderBook],
+    ) -> Result<usize> {
+        let ts = now_unix();
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut del = tx.prepare_cached(
+                "DELETE FROM xregion_books WHERE location_id = ?1 AND type_id = ?2",
+            )?;
+            for &t in fetched_types {
+                del.execute(params![hub as i64, t])?;
+            }
+        }
+        {
+            let mut ins = tx.prepare_cached(
+                "INSERT INTO xregion_books (location_id, type_id, region_id, is_npc,
+                    best_bid, bid_qty, best_ask, ask_qty, bid_levels, ask_levels,
+                    bid_depth, ask_depth, skipped_stale, skipped_thin, skipped_wholesale, fetched_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            )?;
+            for b in books {
+                ins.execute(params![
+                    b.location_id as i64,
+                    b.type_id,
+                    region as i64,
+                    b.is_npc_station as i64,
+                    b.best_bid,
+                    b.bid_qty as i64,
+                    b.best_ask,
+                    b.ask_qty as i64,
+                    b.bid_levels,
+                    b.ask_levels,
+                    serde_json::to_string(&b.bid_depth).unwrap_or_else(|_| "[]".into()),
+                    serde_json::to_string(&b.ask_depth).unwrap_or_else(|_| "[]".into()),
+                    b.skipped_stale,
+                    b.skipped_thin,
+                    b.skipped_wholesale,
+                    ts,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(books.len())
+    }
+
+    /// 年龄闸门在读取端：cutoff 之前的行视为过期数据，不参与配对（诚实优先）。
+    pub fn load_xregion_books(&self, cutoff_ts: i64) -> Result<Vec<StationOrderBook>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT location_id, type_id, is_npc, best_bid, bid_qty, best_ask, ask_qty,
+                    bid_levels, ask_levels, bid_depth, ask_depth,
+                    skipped_stale, skipped_thin, skipped_wholesale
+             FROM xregion_books WHERE fetched_at >= ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff_ts], |r| {
+            Ok(StationOrderBook {
+                location_id: r.get::<_, i64>(0)? as u64,
+                type_id: r.get::<_, i64>(1)? as u32,
+                is_npc_station: r.get::<_, i64>(2)? != 0,
+                best_bid: r.get(3)?,
+                bid_qty: r.get::<_, i64>(4)? as u64,
+                best_ask: r.get(5)?,
+                ask_qty: r.get::<_, i64>(6)? as u64,
+                bid_levels: r.get(7)?,
+                ask_levels: r.get(8)?,
+                bid_depth: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                ask_depth: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default(),
+                skipped_stale: r.get(11)?,
+                skipped_thin: r.get(12)?,
+                skipped_wholesale: r.get(13)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 供 UI/daemon 给跨区行标注数据年龄：站 → 最近一次抓取时刻。
+    pub fn xregion_ages(&self) -> Result<std::collections::HashMap<u64, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT location_id, MAX(fetched_at) FROM xregion_books GROUP BY location_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 表有界的最后一道保险：把 cutoff 之前的所有 xregion 行剪掉。
+    pub fn prune_xregion(&self, before_ts: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM xregion_books WHERE fetched_at < ?1",
+            params![before_ts],
+        )?)
+    }
+
+    /// flip 的枢纽集 = 常规枢纽池 ∪ 跨区枢纽站（以 xregion_books 实际有行为准）。
+    /// scan 只取 location_id 集合；order_count 是部分和、share_pct=0 是诚实占位。
+    pub fn flip_hubs(&self) -> Result<Vec<crate::market::Hub>> {
+        let mut hubs = self.hub_pool()?;
+        let cutoff = now_unix() - crate::market::XREGION_MAX_AGE_SECS;
+        let mut stmt = self.conn.prepare(
+            "SELECT location_id, SUM(bid_levels + ask_levels) FROM xregion_books
+             WHERE fetched_at >= ?1 GROUP BY location_id ORDER BY location_id",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+            ))
+        })?;
+        let fresh: Vec<(u64, u64)> = rows.collect::<std::result::Result<_, _>>()?;
+        for (location_id, order_count) in fresh.into_iter() {
+            if hubs.iter().any(|h| h.location_id == location_id) {
+                continue;
+            }
+            hubs.push(crate::market::Hub {
+                location_id,
+                order_count,
+                share_pct: 0.0,
+                rank: hubs.len() + 1,
+            });
+        }
+        Ok(hubs)
+    }
+
+    pub fn record_xregion_log(&self, l: &XRegionLog) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO xregion_log (started_at, types, regions, requests, orders,
+                books_written, failed, seconds, status)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                l.started_at,
+                l.types,
+                l.regions,
+                l.requests,
+                l.orders,
+                l.books_written,
+                l.failed,
+                l.seconds,
+                l.status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_xregion_log(&self) -> Result<Option<XRegionLog>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT started_at, types, regions, requests, orders, books_written,
+                    failed, seconds, status
+             FROM xregion_log ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([], |r| {
+            Ok(XRegionLog {
+                started_at: r.get(0)?,
+                types: r.get(1)?,
+                regions: r.get(2)?,
+                requests: r.get(3)?,
+                orders: r.get(4)?,
+                books_written: r.get(5)?,
+                failed: r.get(6)?,
+                seconds: r.get(7)?,
+                status: r.get(8)?,
+            })
+        })?;
+        Ok(rows.next().and_then(std::result::Result::ok))
+    }
 }
 
 #[cfg(test)]
@@ -1826,5 +2114,118 @@ mod flip_persist_tests {
     fn last_round_age_absent_before_any_round() {
         let db = Db::in_memory().unwrap();
         assert_eq!(db.last_round_age_secs().unwrap(), None);
+    }
+}
+
+/// M4b 生命周期与跨区单簿的读写层测试（独立模块，与 flip_persist_tests 平级）。
+#[cfg(test)]
+mod lifecycle_persist_tests {
+    use super::*;
+    use crate::market::lifecycle::{OppRecord, OppState};
+
+    fn xb(loc: u64, ty: u32) -> StationOrderBook {
+        StationOrderBook {
+            location_id: loc,
+            type_id: ty,
+            is_npc_station: true,
+            best_bid: Some(3.0),
+            bid_qty: 10,
+            best_ask: Some(4.0),
+            ask_qty: 10,
+            bid_levels: 5,
+            ask_levels: 5,
+            bid_depth: vec![],
+            ask_depth: vec![],
+            skipped_stale: 0,
+            skipped_thin: 0,
+            skipped_wholesale: 0,
+        }
+    }
+
+    #[test]
+    fn opps_roundtrip_and_terminal_prune() {
+        let db = Db::in_memory().unwrap();
+        let r = OppRecord {
+            type_id: 34,
+            buy_loc: 60003760,
+            sell_loc: 60008494,
+            state: OppState::New,
+            miss_streak: 0,
+            first_seen_at: 100,
+            last_seen_at: 200,
+            best_margin_pct: 5.0,
+            last_margin_pct: 4.0,
+            last_net_total: 100.0,
+            last_qty: 10,
+            notified_at: None,
+            notified_day: None,
+            notified_count_day: 0,
+            last_notified_margin_pct: None,
+        };
+        db.save_opp(&r).unwrap();
+        assert_eq!(db.load_opps().unwrap(), vec![r.clone()]);
+        // 同 key 再存 = UPSERT（不是新行；主键即三维复合键）
+        db.save_opp(&OppRecord {
+            state: OppState::Notified,
+            last_seen_at: 250,
+            ..r.clone()
+        })
+        .unwrap();
+        let all = db.load_opps().unwrap();
+        assert_eq!(all.len(), 1, "三维主键去重");
+        assert_eq!(all[0].state, OppState::Notified, "字段随 UPSERT 更新");
+        assert_eq!(all[0].first_seen_at, 100, "first_seen 是首次登记时刻，UPSERT 不覆盖");
+        // 把主键换到 expired 状态；剪枝只碰终态且久未见的行。
+        db.save_opp(&OppRecord {
+            state: OppState::Expired,
+            ..r.clone()
+        })
+        .unwrap();
+        assert_eq!(db.prune_opps_terminal(150).unwrap(), 0, "last_seen=250 未过期");
+        assert_eq!(db.prune_opps_terminal(260).unwrap(), 1, "终态且 last_seen<260 → 剪");
+        assert_eq!(db.load_opps().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn xregion_write_is_per_type_replace_and_age_filtered() {
+        let db = Db::in_memory().unwrap();
+        // 第一批：类型 34/35 各一本
+        db.write_xregion_books(60008494, 10000043, &[34, 35], &[xb(60008494, 34), xb(60008494, 35)])
+            .unwrap();
+        assert_eq!(db.load_xregion_books(0).unwrap().len(), 2);
+        // 第二批只取 34：34 换新、35 旧行保留（跨批语义）
+        db.write_xregion_books(60008494, 10000043, &[34], &[xb(60008494, 34)])
+            .unwrap();
+        assert_eq!(db.load_xregion_books(0).unwrap().len(), 2);
+        // 第三批取 34 但聚合为空（薄档）：34 的旧行必须被删
+        db.write_xregion_books(60008494, 10000043, &[34], &[]).unwrap();
+        let rest = db.load_xregion_books(0).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].type_id, 35);
+        // 年龄闸门：cutoff 高于写入时刻 → 全部不可见
+        let cutoff = now_unix() + 10;
+        assert_eq!(db.load_xregion_books(cutoff).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn flip_hubs_unions_hub_pool_with_xregion_locations() {
+        use crate::market::Hub;
+        let db = Db::in_memory().unwrap();
+        db.write_hub_pool(&[Hub {
+            location_id: 60003760,
+            order_count: 100,
+            share_pct: 80.0,
+            rank: 1,
+        }])
+        .unwrap();
+        db.write_xregion_books(60008494, 10000043, &[34], &[xb(60008494, 34)])
+            .unwrap();
+        let hubs = db.flip_hubs().unwrap();
+        assert_eq!(hubs.len(), 2, "常规枢纽 + 跨区站在有实际行时并入");
+        assert!(hubs.iter().any(|h| h.location_id == 60003760));
+        assert!(hubs.iter().any(|h| h.location_id == 60008494));
+        // 跨区行被整批替换删光后，该站不再出现在枢纽集里
+        db.write_xregion_books(60008494, 10000043, &[34], &[]).unwrap();
+        assert_eq!(db.flip_hubs().unwrap().len(), 1);
     }
 }

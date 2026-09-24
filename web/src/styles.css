@@ -276,6 +276,10 @@ button:hover {
   color: var(--dim);
   font-size: 11px;
   padding: 6px 0 3px;
+  /* 表头跟数字同靠右：表头曾默认左对齐，同一等宽轨道里标签贴轨道起点、
+     数字贴终点，每列视觉上斜一眼（用户截图实测）。靠右后表头与每行
+     数字共用同一条右边界，同列纵向可直接对比。 */
+  text-align: right;
 }
 
 .ladder .row {

@@ -117,6 +117,10 @@ pub fn evaluate_pair(a: &StationOrderBook, b: &StationOrderBook, p: &FlipParams)
 
 ```rust
 for a in group {
+    // 买站没有卖盘就买不进；不计入"评估对"——与抽取前统计口径逐位一致。
+    if a.best_ask.filter(|v| *v > 0.0).is_none() {
+        continue;
+    }
     for b in group {
         if a.location_id == b.location_id { continue; }
         out.stats.pairs_evaluated += 1;

@@ -33,6 +33,9 @@ urlencoding = "2"
 getrandom = "0.2"
 # default-features = false 只留 windows-native，避免默认拖入 linux secret-service 依赖链
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+# SSO 回环回调只收一个 GET，用它的 recv_timeout + 请求解析即可；
+# 不引 async HTTP 服务端框架（登录是用户手点的一次性动作）。
+tiny_http = "0.12"
 
 emd-core = { path = "crates/emd-core" }
 

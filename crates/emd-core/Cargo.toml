@@ -22,6 +22,7 @@ sha2 = { workspace = true }
 urlencoding = { workspace = true }
 getrandom = { workspace = true }
 keyring = { workspace = true }
+tiny_http = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

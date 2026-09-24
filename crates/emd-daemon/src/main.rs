@@ -31,6 +31,7 @@ enum Command {
     Search,
     List,
     History,
+    Flip,
 }
 
 #[derive(Debug)]
@@ -86,6 +87,7 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
             "search" => cmd = Some(Command::Search),
             "list" => cmd = Some(Command::List),
             "history" => cmd = Some(Command::History),
+            "flip" => cmd = Some(Command::Flip),
             "--db" => db = PathBuf::from(it.next().context("--db 缺参数")?),
             "--word" => word = it.next().context("--word 缺参数")?,
             "--type" => {
@@ -115,7 +117,7 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
                         .context("--rounds 需要数字")?,
                 )
             }
-            "--limit" => {
+            "--limit" | "--top" => {
                 limit = Some(
                     it.next()
                         .and_then(|s| s.parse().ok())
@@ -133,7 +135,7 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
     }
 
     Ok(Args {
-        command: cmd.context("缺少子命令（round|serve|prices|verify|probe|stats|hubs|jita|names|tree|search|list|history）")?,
+        command: cmd.context("缺少子命令（round|serve|prices|verify|probe|stats|hubs|jita|names|tree|search|list|history|flip）")?,
         db,
         region,
         ua,
@@ -164,6 +166,7 @@ fn print_usage() {
   stats    本地库现状、上一轮台账与令牌余量
   hubs     打印当前枢纽池（含站点名）
   jita     打印吉他单站单簿前 --limit 行
+  flip     倒卖扫描（读本地快照）：Top N 机会 + 丢弃原因分布；费率与技能取面板参数
   names    解析库里未命名的 NPC 站（POST /v1/universe/names）
   tree     一次性建分类树（约 1 000 次请求，实测 1-2 分钟）
   search   按名称搜类型（--word，走 POST /v1/universe/ids，只取 inventory_types）
@@ -171,7 +174,8 @@ fn print_usage() {
   history  跑一趟 T3 历史日线（§3.3 的 L0/L1）。--dry 只看计划，--probe 量限流组归属
 
   --rounds N   serve 跑满 N 轮后退出；round 隐含 1
-  --limit N    jita/names/tree/list 输出行数上限（默认 20）；history 下表示目标数上限
+  --limit N    jita/names/tree/list/flip 输出行数上限（默认 20）；history 下表示目标数上限
+  --top N      --limit 的别名（flip 的 Top N，缺省 20）
   --type N     history 只取这一个类型
   --dry        history 只打印取数计划与成本估算，不发请求
   --probe      history 的交叉实验：证明 history 不占 market-order 令牌组
@@ -220,6 +224,7 @@ async fn main() -> Result<()> {
         Command::Probe => run_gate(&client, &db, false).await?,
         Command::Stats => run_stats(&client, &db, &db_path)?,
         Command::Hubs => run_hubs(&db)?,
+        Command::Flip => run_flip(&db, args.limit.unwrap_or(20))?,
         Command::Jita => run_jita(&db, args.limit.unwrap_or(20))?,
         Command::Names => {
             let n = catalog::resolve_missing(&client, &db, args.limit.unwrap_or(400)).await?;
@@ -712,6 +717,74 @@ fn run_hubs(db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// 倒卖扫描（M4a spec §3.2）：读本地快照跑 flip::scan。
+/// 0 机会时输出丢弃原因分布——没它用户会把正常过滤当成 bug。
+fn run_flip(db: &Db, top: u32) -> Result<()> {
+    let books = db.load_books()?;
+    let hubs = db.hub_pool()?;
+    let vol = db.latest_vol24()?;
+    let params = db.get_flip_params()?;
+    let age = db.last_round_age_secs()?;
+    let f = &params.fees;
+    println!(
+        "倒卖扫描：单簿 {} 个｜枢纽 {} 个｜有效销售税 {:.2}%｜有效中介费 {:.3}%｜技能 A{} B{}｜阈值 {:.1}%｜快照 {}",
+        books.len(),
+        hubs.len(),
+        f.effective_sales_tax() * 100.0,
+        f.effective_broker() * 100.0,
+        f.accounting,
+        f.broker_relations,
+        params.margin_threshold_pct,
+        age.map(|s| format!("{s}s 前"))
+            .unwrap_or_else(|| "无（先跑 round）".into()),
+    );
+    let out = market::scan(&books, &hubs, &params, &vol);
+    if out.opportunities.is_empty() {
+        println!(
+            "本轮 0 机会：评估 {} 对｜want<批量 {}｜短填 {}｜未过阈值 {}",
+            out.stats.pairs_evaluated,
+            out.stats.dropped_batch,
+            out.stats.dropped_shortfall,
+            out.stats.dropped_threshold
+        );
+        return Ok(());
+    }
+    println!(
+        "{:<30} {:<34} {:>12} {:>12} {:>8} {:>9} {:>14} {:>9}",
+        "类型", "买站→卖站", "买价", "卖价", "可成交", "净利率%", "总净利", "24h量"
+    );
+    for o in out.opportunities.iter().take(top as usize) {
+        let tname = db.type_name(o.type_id)?.unwrap_or_else(|| o.type_id.to_string());
+        let an = db.station_name(o.buy_loc)?.unwrap_or_else(|| o.buy_loc.to_string());
+        let bn = db.station_name(o.sell_loc)?.unwrap_or_else(|| o.sell_loc.to_string());
+        let vsrc = if o.vol_source == market::VolSource::History { " " } else { "*" };
+        println!(
+            "{:<30} {:<34} {:>12} {:>12} {:>8} {:>8.2}% {:>14} {:>8}{}",
+            ellipsis(&tname, 30),
+            ellipsis(&format!("{an}→{bn}"), 34),
+            fmt_price(o.buy_price),
+            fmt_price(o.sell_price),
+            o.qty,
+            o.margin_pct,
+            fmt_price(o.net_total),
+            o.vol24,
+            vsrc,
+        );
+    }
+    println!("注：24h 量带 * = 该类型无 history 覆盖，用可执行深度估算；费率为估算口径。");
+    Ok(())
+}
+
+/// 长名字截断，防止中文站名把表格列顶飞。
+fn ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 fn run_jita(db: &Db, limit: u32) -> Result<()> {
     let rows = db.station_book(STATION_JITA, true)?;
     println!(
@@ -786,7 +859,7 @@ mod tests {
         // 保证 help 里列的每个子命令都能被解析到，不会写出说明里没有（或说明里有但没实现）的命令。
         let words = [
             "round", "serve", "prices", "verify", "probe", "stats", "hubs", "jita", "names",
-            "tree", "search", "list", "history",
+            "tree", "search", "list", "history", "flip",
         ];
         let want = [
             Command::Round,
@@ -802,6 +875,7 @@ mod tests {
             Command::Search,
             Command::List,
             Command::History,
+            Command::Flip,
         ];
         for (w, x) in words.iter().zip(want.iter()) {
             let a = parse_from([w.to_string()].into_iter()).unwrap_or_else(|e| panic!("{w}: {e}"));
@@ -824,5 +898,14 @@ mod tests {
         assert!(parse_from(["history", "--nope"].into_iter().map(String::from)).is_err());
         assert!(parse_from(["history", "--limit"].into_iter().map(String::from)).is_err());
         assert!(parse_from(["--dry"].into_iter().map(String::from)).is_err());
+    }
+
+    #[test]
+    fn flip_flags_parse() {
+        let a = parse_from(["flip"].into_iter().map(String::from)).unwrap();
+        assert_eq!(a.command, Command::Flip);
+        assert_eq!(a.limit, None, "不传 --top/--limit 时由派发层决定默认 20");
+        let b = parse_from(["flip", "--top", "10"].into_iter().map(String::from)).unwrap();
+        assert_eq!(b.limit, Some(10), "--top 是 --limit 的别名");
     }
 }

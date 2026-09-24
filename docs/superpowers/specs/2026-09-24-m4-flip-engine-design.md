@@ -70,7 +70,9 @@ pub struct FlipParams {
 
 ### 2.3 扫描算法 `flip::scan`
 
-签名：`pub fn scan(books: &[StationOrderBook], hubs: &[Hub], params: &FlipParams, vol24: &HashMap<u32, u64>) -> Vec<Opportunity>`
+签名：`pub fn scan(books: &[StationOrderBook], hubs: &[Hub], params: &FlipParams, vol24: &HashMap<u32, u64>) -> ScanOutcome`
+
+`ScanOutcome { opportunities: Vec<Opportunity>, stats: ScanStats }`；`ScanStats` 记录 `pairs_evaluated / dropped_batch / dropped_shortfall / dropped_threshold` 四计数，daemon 与 UI 空态用「丢弃原因分布」，不让用户把“0 机会”当成 bug。`trial()`（试算）与 scan 共用同一费率出口。
 
 ```
 枢纽集 = hubs 的 location_id 集合（hub_pool 已保证 NPC 站 + ≥50 单 + 前 20）

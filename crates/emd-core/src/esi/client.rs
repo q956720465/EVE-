@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT_ENCODING, CONTENT_TYPE, IF_NONE_MATCH, USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, IF_NONE_MATCH, USER_AGENT,
 };
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -230,11 +230,35 @@ impl EsiClient {
 
     /// `force = true` 只给用户手点刷新；调度器一律传 false，否则等于绕过缓存。
     pub async fn fetch_opt(&self, path_and_query: &str, force: bool) -> Result<Fetch> {
+        self.fetch_inner(path_and_query, force, None).await
+    }
+
+    /// 角色端点专用：带 Bearer 走同一条缓存/节流/重试纪律。
+    ///
+    /// 独立入口（而不是给 client 挂一个全局令牌）是为了让"公开请求永不携带令牌"成为类型事实：
+    /// 令牌只从这一个入参流进请求构造，公开路径根本没有拿它的地方。
+    ///
+    /// 缓存键仍是 URL（不含令牌）。这没有问题且是刻意的：角色端点的路径自带 character_id，
+    /// 同一角色换了令牌拿到的还是同一份数据，不会串号。
+    pub async fn fetch_auth(&self, path_and_query: &str, token: &str) -> Result<Fetch> {
+        self.fetch_inner(path_and_query, false, Some(token)).await
+    }
+
+    /// 缓存/节流/重试的唯一主体，公开与带令牌两条入口都从这里走。
+    ///
+    /// 没有复制一份"带令牌版"：两份实现迟早会在退避、令牌水位或 304 处理上走偏，
+    /// 而这类偏差在真实限流下才暴露。令牌只是穿过它的一件行李。
+    async fn fetch_inner(
+        &self,
+        path_and_query: &str,
+        force: bool,
+        bearer: Option<&str>,
+    ) -> Result<Fetch> {
         let url = self.absolutize(path_and_query);
         let mut last_err: Option<Error> = None;
 
         for attempt in 0..=self.cfg.page_retry_limit {
-            match self.try_fetch(&url, force).await {
+            match self.try_fetch(&url, force, bearer).await {
                 Ok(f) => return Ok(f),
                 Err(Error::RateLimited { retry_after }) => {
                     // 429 必须按 Retry-After 等，不能只按自己的退避曲线。
@@ -276,6 +300,14 @@ impl EsiClient {
 
     pub async fn get_json<T: DeserializeOwned>(&self, path_and_query: &str) -> Result<T> {
         self.fetch(path_and_query).await?.json()
+    }
+
+    pub async fn get_json_auth<T: DeserializeOwned>(
+        &self,
+        path_and_query: &str,
+        token: &str,
+    ) -> Result<T> {
+        self.fetch_auth(path_and_query, token).await?.json()
     }
 
     /// 裸 JSON POST。**不进条件请求缓存** —— 缓存键是 URL，而这类接口的语义由
@@ -359,7 +391,7 @@ impl EsiClient {
         }
     }
 
-    async fn try_fetch(&self, url: &str, force: bool) -> Result<Fetch> {
+    async fn try_fetch(&self, url: &str, force: bool, bearer: Option<&str>) -> Result<Fetch> {
         let now = Instant::now();
 
         // ① 未到 Expires 就不发请求 —— 防封禁的第一道闸。
@@ -391,6 +423,11 @@ impl EsiClient {
         let mut req = self.http.get(url);
         if let Some(t) = &etag {
             req = req.header(IF_NONE_MATCH, t.as_str());
+        }
+        // 令牌只在这一处注入、且只为角色端点注入：`bearer` 为 None 时连头都不构造。
+        // 令牌进不了缓存键（键仍只是 URL），也进不了任何日志/错误串 —— 出错时打印的只有 URL。
+        if let Some(t) = bearer {
+            req = req.header(AUTHORIZATION, format!("Bearer {t}"));
         }
 
         let resp = req.send().await.map_err(|source| Error::Transport {
@@ -561,6 +598,8 @@ fn read_watermark(headers: &HeaderMap) -> Watermark {    Watermark {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
 
     fn status(code: u16) -> Error {
@@ -622,5 +661,77 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("expires", "-1".parse().unwrap());
         assert!(expires_at(&h, now).is_none());
+    }
+
+    /// 真起一个本地回声服务，记录每个请求收到的 `Authorization`（缺失记 None），回一段最小 JSON。
+    ///
+    /// 用真 socket 而不是断言一个手搭的 header map：本任务要证的恰恰是"报文里到底有没有这个头"，
+    /// 只检查自己构造的请求对象等于复述实现，漏掉的正是发出前的那一段。
+    /// 端口绑 0 让 OS 分配，测试之间不抢端口。
+    fn echo_server(requests: usize) -> (String, mpsc::Receiver<Option<String>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..requests {
+                // 请求没来（实现回归了）时别把测试挂死：超时就收摊，断言侧会看到通道关闭。
+                let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(10)) else {
+                    return;
+                };
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("authorization"))
+                    .map(|h| h.value.as_str().to_string());
+                let _ = tx.send(auth);
+                let _ = req.respond(tiny_http::Response::from_string(r#"{"ok":true}"#));
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    fn client_at(base_url: &str) -> EsiClient {
+        EsiClient::new(EsiConfig {
+            base_url: base_url.to_string(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_requests_carry_bearer_header_and_public_ones_do_not() {
+        let (base_url, seen) = echo_server(2);
+        let c = client_at(&base_url);
+
+        // ① 角色端点：服务端必须看到 `Authorization: Bearer <token>`。
+        let v: serde_json::Value = c
+            .get_json_auth("/characters/123/orders/?page=1", "ACCESS_TOKEN")
+            .await
+            .unwrap();
+        assert_eq!(v, serde_json::json!({ "ok": true }));
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Some("Bearer ACCESS_TOKEN".to_string())
+        );
+
+        // ② 公开端点：连这个头的存在都不该有 —— 带上令牌毫无必要，且会让"缓存键只是 URL"的语义被污染。
+        let _: serde_json::Value = c.get_json("/markets/prices/").await.unwrap();
+        assert_eq!(seen.recv_timeout(Duration::from_secs(10)).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn fetch_auth_carries_the_bearer_and_plain_fetch_does_not() {
+        let (base_url, seen) = echo_server(2);
+        let c = client_at(&base_url);
+
+        let f = c.fetch_auth("/characters/42/wallet/", "T2").await.unwrap();
+        assert_eq!(f.meta().status, 200);
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Some("Bearer T2".to_string())
+        );
+
+        let _ = c.fetch("/status/").await.unwrap();
+        assert_eq!(seen.recv_timeout(Duration::from_secs(10)).unwrap(), None);
     }
 }

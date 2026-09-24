@@ -13,6 +13,7 @@ pub mod error;
 pub mod esi;
 pub mod market;
 pub mod scheduler;
+pub mod sso;
 pub mod store;
 pub mod tree;
 

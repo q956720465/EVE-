@@ -27,6 +27,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 fs2 = "0.3"
+base64 = "0.22"
+sha2 = "0.10"
+urlencoding = "2"
+getrandom = "0.2"
 
 emd-core = { path = "crates/emd-core" }
 

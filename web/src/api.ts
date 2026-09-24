@@ -1,4 +1,4 @@
-import type { AppStatus, HistoryBar, Hub, ListingRow, TreeGroup, TreeNode, TypeDetail } from "./types";
+import type { AppStatus, FlipParams, FlipRow, FlipScan, HistoryBar, Hub, ListingRow, TrialOut, TreeGroup, TreeNode, TypeDetail } from "./types";
 
 /**
  * 与 Rust 后端的唯一边界。
@@ -71,6 +71,32 @@ export const api = {
   async removeWatch(typeId: number): Promise<boolean> {
     if (!inTauri) return false;
     return call<boolean>("remove_watch", { typeId });
+  },
+
+  /** 倒卖扫描：读本地快照跑引擎（纯本地，零 ESI 请求）。 */
+  async flipScan(): Promise<FlipScan> {
+    if (!inTauri) return fixFlip();
+    return call<FlipScan>("scan_flip");
+  },
+
+  async flipParams(): Promise<FlipParams> {
+    if (!inTauri) return fixFlipParams;
+    return call<FlipParams>("get_flip_params");
+  },
+
+  async setFlipParams(params: FlipParams): Promise<void> {
+    if (!inTauri) {
+      // 预览模式只存面板回显；行数据是演示常数，不重算（见 fixFlip 注释）。
+      fixFlipParams = params;
+      return;
+    }
+    await call("set_flip_params", { params });
+  },
+
+  /** 单笔试算：费率公式只有 Rust 一份（spec R6），这里不复制。 */
+  async trialCalc(buyPrice: number, sellPrice: number, qty: number): Promise<TrialOut> {
+    if (!inTauri) return fixTrial();
+    return call<TrialOut>("trial_calc", { buyPrice, sellPrice, qty });
   },
 };
 
@@ -218,4 +244,63 @@ function fixHubs(): Hub[] {
     { location_id: 60015157, order_count: 5_492, share_pct: 1.35, rank: 2, name: "Kisogo VII - AIR Laboratories" },
     { location_id: 60015027, order_count: 1_750, share_pct: 0.43, rank: 3, name: "Uitra VI - Moon 4" },
   ];
+}
+
+// ---- M4a 倒卖引擎的演示数据 ------------------------------------------------
+// 关键口径：fixture 行是**演示常数**，不复刻费率公式（spec R6 单一出口在
+// Rust 侧）。技能步进器在预览模式只回显参数与角标，真实数值变化由 daemon
+// 真机对比与 cargo 单测验证。
+let fixFlipParams: FlipParams = {
+  fees: { sales_tax_pct: 7.5, broker_pct: 3.0, accounting: 0, broker_relations: 0, faction_standing: 0, corp_standing: 0 },
+  margin_threshold_pct: 3.0,
+  capital_isk: 100_000_000,
+  capital_pct_per_trade: 5.0,
+  min_batch: 100,
+  freight_isk_per_unit: 0,
+  include_buy_broker: false,
+};
+
+function fixFlip(): FlipScan {
+  const rows: FlipRow[] = [
+    {
+      type_id: 36, type_name: "Isogen",
+      buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
+      sell_loc: 60015027, sell_loc_name: "Uitra VI - Moon 4",
+      buy_price: 17.04, sell_price: 19.9, qty: 120_000,
+      net_per_unit: 1.42, net_total: 170_400, margin_pct: 8.33,
+      vol24: 44_000_000, vol_source: "history", buy_levels: 37, sell_levels: 9,
+    },
+    {
+      type_id: 34, type_name: "Tritanium",
+      buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
+      sell_loc: 60015157, sell_loc_name: "Kisogo VII - AIR Laboratories",
+      buy_price: 3.94, sell_price: 4.55, qty: 2_000_000,
+      net_per_unit: 0.131, net_total: 262_000, margin_pct: 3.32,
+      vol24: 1_240_000_000, vol_source: "history", buy_levels: 24, sell_levels: 11,
+    },
+    {
+      type_id: 88087, type_name: "Eleutrium",
+      buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
+      sell_loc: 60015157, sell_loc_name: "Kisogo VII - AIR Laboratories",
+      buy_price: 9.85, sell_price: 9.2, qty: 2_100,
+      net_per_unit: -1.55, net_total: -3_255, margin_pct: -15.7,
+      vol24: 2_100, vol_source: "depth", buy_levels: 16, sell_levels: 3,
+    },
+  ];
+  return {
+    rows,
+    pairs_evaluated: 268,
+    dropped_batch: 231,
+    dropped_shortfall: 0,
+    dropped_threshold: 34,
+    age_secs: 95,
+    params: fixFlipParams,
+    effective_sales_tax_pct: 7.5,
+    effective_broker_pct: 3.0,
+  };
+}
+
+function fixTrial(): TrialOut {
+  // 演示回答：负数演示"默认口径扣税后亏损"这条 UI 告警；不跑公式（见上）。
+  return { net_per_unit: -1.55, net_total: -15.5, margin_pct: -1.55 };
 }

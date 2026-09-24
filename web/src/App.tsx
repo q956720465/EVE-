@@ -5,6 +5,7 @@ import TopBar from "./components/TopBar";
 import CatalogTree from "./components/CatalogTree";
 import TypeTable from "./components/TypeTable";
 import OrderBook from "./components/OrderBook";
+import FlipScanner from "./components/FlipScanner";
 import { fmtDur } from "./format";
 
 export default function App() {
@@ -16,6 +17,8 @@ export default function App() {
   const query = useStore((s) => s.query);
   const searchResults = useStore((s) => s.searchResults);
   const groupName = useStore((s) => s.groupName);
+  const view = useStore((s) => s.view);
+  const flip = useStore((s) => s.flip);
 
   useEffect(() => {
     void boot();
@@ -26,11 +29,17 @@ export default function App() {
   return (
     <div className="app">
       <TopBar />
-      <div className="panes">
-        <CatalogTree />
-        <TypeTable />
-        <OrderBook />
-      </div>
+      {view === "flip" ? (
+        <div className="panes one">
+          <FlipScanner />
+        </div>
+      ) : (
+        <div className="panes">
+          <CatalogTree />
+          <TypeTable />
+          <OrderBook />
+        </div>
+      )}
       <div className="statusbar">
         <span>{error ? <span className="hint">⚠ {error}</span> : "就绪"}</span>
         {status && (
@@ -53,7 +62,11 @@ export default function App() {
         )}
         <span className="grow" />
         {/* 搜索态下中栏摆的是搜索结果，状态栏却还报上一组的行数——两处口径打架（走查 #14）。 */}
-        {query.trim().length >= 2 ? (
+        {view === "flip" ? (
+          <span>
+            {(flip?.rows.length ?? 0).toLocaleString()} 条机会 · 倒卖扫描
+          </span>
+        ) : query.trim().length >= 2 ? (
           <span>{searchResults.length} 行 · 搜索中</span>
         ) : (
           <span>{rows.length.toLocaleString()} 行 · {groupName}</span>

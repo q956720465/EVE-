@@ -392,3 +392,173 @@ button:hover {
     flex-wrap: nowrap;
   }
 }
+
+/* ---------- M4a：倒卖扫描器 ---------- */
+.panes.one {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.viewswitch {
+  display: inline-flex;
+  gap: 4px;
+}
+.viewswitch button.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.flip {
+  display: flex;
+  flex-direction: column;
+}
+.flip h3 {
+  margin: 0 0 8px;
+}
+
+.badges {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.badges .b {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.flip-params {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+}
+.flip-params .fold {
+  border: none;
+  background: none;
+  color: var(--dim);
+  padding: 0;
+  font-size: 11px;
+}
+.flip-params .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px 14px;
+  margin-top: 10px;
+}
+.flip-params label,
+.flip-trial label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.flip-params input[type="number"],
+.flip-trial input {
+  width: 100%;
+}
+.flip-params input[type="checkbox"] {
+  width: auto;
+  align-self: flex-start;
+  margin-top: 4px;
+}
+
+.flip-skills {
+  display: flex;
+  gap: 14px;
+  align-items: end;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.flip-skills button.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.flip-trial {
+  display: flex;
+  gap: 10px;
+  align-items: end;
+  flex-wrap: wrap;
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+  margin-top: 10px;
+}
+.flip-trial .out {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.flip-sort {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.flip-sort button.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.flip-tablewrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.flip-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.flip-table th,
+.flip-table td {
+  padding: 5px 10px;
+  white-space: nowrap;
+  text-align: right;
+  font-size: 12px;
+}
+.flip-table th {
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 500;
+  border-bottom: 1px solid var(--line);
+}
+.flip-table th.l,
+.flip-table td.l {
+  text-align: left;
+}
+.flip-table tbody tr:hover {
+  background: #17212a;
+}
+.flip-table .dim,
+.flip-sort .dim {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.vsrc {
+  font-size: 10px;
+  color: var(--dim);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.neg {
+  color: var(--ask);
+}
+.pos {
+  color: var(--bid);
+}
+
+.flip .note {
+  margin-top: 10px;
+  color: var(--dim);
+  font-size: 11px;
+}

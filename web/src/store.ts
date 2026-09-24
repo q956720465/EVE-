@@ -1,9 +1,12 @@
 import { create } from "zustand";
 import { api } from "./api";
-import type { AppStatus, Hub, ListingRow, TreeNode, TypeDetail } from "./types";
+import type { AppStatus, FlipParams, FlipScan, FlipSortKey, Hub, ListingRow, TrialOut, TreeNode, TypeDetail } from "./types";
 
 /** 吉他。主视图默认站点，切换枢纽时改这里。 */
 export const JITA = 60003760;
+
+/** 顶层视图：市场浏览（三栏）与倒卖扫描（全宽）。 */
+export type View = "market" | "flip";
 
 interface State {
   tree: TreeNode[];
@@ -23,6 +26,12 @@ interface State {
   busy: boolean;
   error: string | null;
 
+  view: View;
+  flip: FlipScan | null;
+  flipSort: FlipSortKey;
+  flipBusy: boolean;
+  trial: TrialOut | null;
+
   boot(): Promise<void>;
   toggle(categoryId: number): void;
   selectGroup(groupId: number, name: string): Promise<void>;
@@ -30,6 +39,11 @@ interface State {
   selectType(typeId: number): Promise<void>;
   search(word: string): Promise<void>;
   tick(): Promise<void>;
+  setView(view: View): void;
+  loadFlip(): Promise<void>;
+  saveFlipParams(p: FlipParams): Promise<void>;
+  setFlipSort(k: FlipSortKey): void;
+  runTrial(buy: number, sell: number, qty: number): Promise<void>;
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -48,6 +62,12 @@ export const useStore = create<State>((set, get) => ({
   searchResults: [],
   busy: false,
   error: null,
+
+  view: "market",
+  flip: null,
+  flipSort: "score",
+  flipBusy: false,
+  trial: null,
 
   async boot() {
     set({ busy: true, error: null });
@@ -128,6 +148,42 @@ export const useStore = create<State>((set, get) => ({
       if (status.tree[0] > 0 && get().tree.length === 0) await get().boot();
     } catch {
       // 状态轮询失败不值得打断视线；下一次会再来。
+    }
+  },
+
+  setView(view) {
+    set({ view });
+    if (view === "flip" && get().flip === null) void get().loadFlip();
+  },
+
+  async loadFlip() {
+    set({ flipBusy: true });
+    try {
+      set({ flip: await api.flipScan(), flipBusy: false });
+    } catch (e) {
+      set({ flipBusy: false, error: String(e) });
+    }
+  },
+
+  async saveFlipParams(p) {
+    try {
+      await api.setFlipParams(p);
+      // 参数/技能改完立即重扫：纯本地纯函数，零 ESI 请求（spec §3.1 的重算闭环）。
+      await get().loadFlip();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  setFlipSort(flipSort) {
+    set({ flipSort });
+  },
+
+  async runTrial(buy, sell, qty) {
+    try {
+      set({ trial: await api.trialCalc(buy, sell, qty) });
+    } catch (e) {
+      set({ trial: null, error: String(e) });
     }
   },
 }));

@@ -18,6 +18,8 @@ export default function TopBar() {
   const refresh = useStore((s) => s.selectGroup);
   const groupId = useStore((s) => s.groupId);
   const groupName = useStore((s) => s.groupName);
+  const view = useStore((s) => s.view);
+  const setView = useStore((s) => s.setView);
 
   const left = status?.next_in_ms ?? 0;
   const frac = Math.min(1, Math.max(0, 1 - left / CYCLE_MS));
@@ -68,26 +70,39 @@ export default function TopBar() {
         </span>
       )}
 
+      <span className="viewswitch" title="市场 = 三栏浏览；倒卖 = 全宽扫描器">
+        <button className={view === "market" ? "on" : ""} onClick={() => setView("market")}>
+          市场
+        </button>
+        <button className={view === "flip" ? "on" : ""} onClick={() => setView("flip")}>
+          倒卖
+        </button>
+      </span>
+
       <div className="grow" />
 
-      <input
-        className="search"
-        aria-label="搜索物品类型"
-        placeholder="搜索类型名（≥2 字，走 universe/ids + 本地别名）"
-        value={word}
-        onChange={(e) => {
-          setWord(e.target.value);
-          void search(e.target.value);
-        }}
-      />
-      <button
-        onClick={() => {
-          if (groupId !== null) void refresh(groupId, groupName);
-        }}
-        title="从本地库重新读取当前组（不会突破 ESI 缓存去抢请求）"
-      >
-        重载本组
-      </button>
+      {view === "market" && (
+        <>
+          <input
+            className="search"
+            aria-label="搜索物品类型"
+            placeholder="搜索类型名（≥2 字，走 universe/ids + 本地别名）"
+            value={word}
+            onChange={(e) => {
+              setWord(e.target.value);
+              void search(e.target.value);
+            }}
+          />
+          <button
+            onClick={() => {
+              if (groupId !== null) void refresh(groupId, groupName);
+            }}
+            title="从本地库重新读取当前组（不会突破 ESI 缓存去抢请求）"
+          >
+            重载本组
+          </button>
+        </>
+      )}
     </div>
   );
 }

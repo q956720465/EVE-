@@ -14,6 +14,7 @@ pub mod config;
 pub mod error;
 pub mod esi;
 pub mod market;
+pub mod push;
 pub mod scheduler;
 pub mod sso;
 pub mod store;

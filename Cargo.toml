@@ -29,6 +29,9 @@ futures = "0.3"
 fs2 = "0.3"
 base64 = "0.22"
 sha2 = "0.10"
+# 钉钉加签用 HMAC-SHA256（M4c T10）。取 0.12 而不是最新的 0.13：0.12 与既有 sha2 0.10
+# 同属 digest 0.10 那一代，0.13 起换 digest 0.11，会把 sha2 分裂成两套不兼容的 trait。
+hmac = "0.12"
 urlencoding = "2"
 getrandom = "0.2"
 # default-features = false 只留 windows-native，避免默认拖入 linux secret-service 依赖链

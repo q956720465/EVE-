@@ -90,6 +90,9 @@ pub struct FlipScanOut {
     pub age_secs: Option<i64>,
     /// 参数面板回显（扫完即回，面板不用再单独拉）。
     pub params: emd_core::market::FlipParams,
+    /// 有效费率由 Rust 算好（%）：面板只显示，不在 TS 复制公式（spec R6）。
+    pub effective_sales_tax_pct: f64,
+    pub effective_broker_pct: f64,
 }
 
 #[derive(Serialize)]
@@ -227,6 +230,8 @@ impl AppState {
                 dropped_shortfall: out.stats.dropped_shortfall,
                 dropped_threshold: out.stats.dropped_threshold,
                 age_secs: age,
+                effective_sales_tax_pct: params.fees.effective_sales_tax() * 100.0,
+                effective_broker_pct: params.fees.effective_broker() * 100.0,
                 params,
             })
         })

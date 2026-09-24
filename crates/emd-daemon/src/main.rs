@@ -49,6 +49,9 @@ struct Args {
     dry: bool,
     /// history 专用：跑限流组归属实验。
     do_probe: bool,
+    /// flip 专用：临时覆盖技能等级做口径对比（不持久化）。
+    accounting: Option<u8>,
+    broker_relations: Option<u8>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -71,6 +74,8 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
     let mut type_id = None;
     let mut dry = false;
     let mut do_probe = false;
+    let mut accounting: Option<u8> = None;
+    let mut broker_relations: Option<u8> = None;
 
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -130,6 +135,20 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
             }
             "--dry" => dry = true,
             "--probe" => do_probe = true,
+            "--accounting" => {
+                accounting = Some(
+                    it.next()
+                        .and_then(|s| s.parse().ok())
+                        .context("--accounting 需要 0-5 的数字")?,
+                )
+            }
+            "--broker-relations" => {
+                broker_relations = Some(
+                    it.next()
+                        .and_then(|s| s.parse().ok())
+                        .context("--broker-relations 需要 0-5 的数字")?,
+                )
+            }
             other => anyhow::bail!("未知参数：{other}"),
         }
     }
@@ -146,6 +165,8 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
         type_id,
         dry,
         do_probe,
+        accounting,
+        broker_relations,
     })
 }
 
@@ -176,6 +197,8 @@ fn print_usage() {
   --rounds N   serve 跑满 N 轮后退出；round 隐含 1
   --limit N    jita/names/tree/list/flip 输出行数上限（默认 20）；history 下表示目标数上限
   --top N      --limit 的别名（flip 的 Top N，缺省 20）
+  --accounting N        flip 临时覆盖 Accounting 等级（0-5，仅本次运行，不写库）
+  --broker-relations N  flip 临时覆盖 Broker Relations 等级（0-5，仅本次运行，不写库）
   --type N     history 只取这一个类型
   --dry        history 只打印取数计划与成本估算，不发请求
   --probe      history 的交叉实验：证明 history 不占 market-order 令牌组
@@ -224,7 +247,7 @@ async fn main() -> Result<()> {
         Command::Probe => run_gate(&client, &db, false).await?,
         Command::Stats => run_stats(&client, &db, &db_path)?,
         Command::Hubs => run_hubs(&db)?,
-        Command::Flip => run_flip(&db, args.limit.unwrap_or(20))?,
+        Command::Flip => run_flip(&db, args.limit.unwrap_or(20), args.accounting, args.broker_relations)?,
         Command::Jita => run_jita(&db, args.limit.unwrap_or(20))?,
         Command::Names => {
             let n = catalog::resolve_missing(&client, &db, args.limit.unwrap_or(400)).await?;
@@ -719,11 +742,18 @@ fn run_hubs(db: &Db) -> Result<()> {
 
 /// 倒卖扫描（M4a spec §3.2）：读本地快照跑 flip::scan。
 /// 0 机会时输出丢弃原因分布——没它用户会把正常过滤当成 bug。
-fn run_flip(db: &Db, top: u32) -> Result<()> {
+fn run_flip(db: &Db, top: u32, acct: Option<u8>, br: Option<u8>) -> Result<()> {
     let books = db.load_books()?;
     let hubs = db.hub_pool()?;
     let vol = db.latest_vol24()?;
-    let params = db.get_flip_params()?;
+    let mut params = db.get_flip_params()?;
+    // 临时覆盖只作用于本次运行：同一个快照上对比技能口径，不写库。
+    if let Some(v) = acct {
+        params.fees.accounting = v.min(5);
+    }
+    if let Some(v) = br {
+        params.fees.broker_relations = v.min(5);
+    }
     let age = db.last_round_age_secs()?;
     let f = &params.fees;
     println!(
@@ -907,5 +937,13 @@ mod tests {
         assert_eq!(a.limit, None, "不传 --top/--limit 时由派发层决定默认 20");
         let b = parse_from(["flip", "--top", "10"].into_iter().map(String::from)).unwrap();
         assert_eq!(b.limit, Some(10), "--top 是 --limit 的别名");
+        let c = parse_from(
+            ["flip", "--accounting", "5", "--broker-relations", "3"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!((c.accounting, c.broker_relations), (Some(5), Some(3)));
+        assert!(parse_from(["flip", "--accounting", "x"].into_iter().map(String::from)).is_err());
     }
 }

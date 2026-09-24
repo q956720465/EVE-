@@ -31,6 +31,7 @@ pub use error::{Error, Result};
 pub use push::{
     dispatch, mask, DingTalkChannel, LocalChannel, PushChannel, PushConfig, PushConfigEcho,
 };
+pub use sso::refresh::{refresh_if_needed, DEFAULT_TOKEN_ENDPOINT};
 
 /// 便捷构造：默认配置 + 指定 UA。
 pub fn client(user_agent: impl Into<String>) -> Result<esi::EsiClient> {

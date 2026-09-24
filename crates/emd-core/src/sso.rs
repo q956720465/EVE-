@@ -5,18 +5,20 @@
 //! 见计划「外部协议常量」节）：
 //! - 授权端点 `https://login.eveonline.com/v2/oauth/authorize`：已核对。
 //! - 令牌端点 `https://login.eveonline.com/v2/oauth/token`：已核对；请求体字段与
-//!   native 无 secret 的说明见子模块 [`token`]（出处与日期在该文件顶部）。
+//!   native 无 secret 的说明见子模块 [`token`]（出处与日期在该文件顶部）。刷新侧另有一份
+//!   字面量在 [`refresh`]（三份里唯一 `pub` 的：生产显式传、测试换桩，见该文件模块头）。
 //! - PKCE `code_challenge_method=S256` 官方支持；native 应用必须先在开发者后台注册
 //!   redirect_uri（回环地址同样要注册，否则授权页直接报错）：已核对。
 //! - **待核**：scope 精确串。本模块不持有 scope 常量（`authorize_url` 只负责拼装，
 //!   由调用方传入）；登录默认的 scope 列表在 [`flow`]，同样待核。
 //!   需注册应用后真机试授权才能确认无 `invalid_scope`。
 //!
-//! 若官方值变动，只改本文件、[`token`]、[`flow`] 三处（各持自己核对过的端点/字段约定）；
-//! [`store`] 与 [`listen`] 不持有任何协议常量，与协议修订无关，无需随协议改动。
+//! 若官方值变动，只改本文件、[`token`]、[`flow`]、[`refresh`] 四处（各持自己核对过的
+//! 端点/字段约定）；[`store`] 与 [`listen`] 不持有任何协议常量，与协议修订无关，无需随协议改动。
 
 pub mod flow;
 pub mod listen;
+pub mod refresh;
 pub mod store;
 pub mod token;
 

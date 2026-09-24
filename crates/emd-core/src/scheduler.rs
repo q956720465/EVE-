@@ -559,7 +559,7 @@ impl Scheduler {
     }
 
     /// 一轮角色同步 + 亏损告警（M4c）。真的同步与判定在 [`alert::update_round`]（那侧的
-    /// 步骤顺序是契约）；这里只做三件事：**开门条件**、令牌 → 角色身份、通道装配。
+    /// 步骤顺序是契约）；这里只做四件事：**开门条件**、令牌刷新、令牌 → 角色身份、通道装配。
     ///
     /// `Ok(None)` 的三种形态都是"这一轮没有能跑的回合"，**都不是错误**（静默跳过）：
     /// ① 配置没启用（`EMD_CHAR_SYNC=0` 的语义由 `CharConfig.enabled` 承载，见 `SchedulerConfig`）；
@@ -568,16 +568,34 @@ impl Scheduler {
     /// ③ 同步没拿到挂单快照（见 `alert::update_round` 的第 ④ 步）。
     ///
     /// 令牌只在本函数的调用链上流转：不进日志、不进错误串、不落库（Global Constraint）。
-    /// 它过期时这里**不刷新**（刷新编排不在 T12 的边界内，T2 只给了请求体构造）：四端点会
-    /// 整轮 401 → ③ 那一支 warn 出"快照未刷新"并跳过这一轮，不静默、也不半推。
+    /// **过期在这里刷新**（spec §4.1「令牌刷新仅在过期时发生」，
+    /// [`crate::sso::refresh::refresh_if_needed`]）：access token 只有 ~20 分钟寿命，长跑的
+    /// 守护进程若不刷，第一轮之后四端点会整轮 403 → ③ 那一支每轮 warn 一次「快照未刷新」，
+    /// 同步、告警、推送就此永久停更（T12 的挂账）。刷新失败如实上抛、由 `run()` 的钩子 warn，
+    /// 不在这里吞掉 —— 下一轮还会再试。
     pub async fn run_char_and_alerts(&self) -> Result<Option<AlertRoundReport>> {
-        // ① 开关与令牌都在最前面：关着的时候连凭据库都不碰（"关"= 彻底不与外界交互）。
+        // ① 开关与令牌两道门都在最前面：关着的时候连凭据库都不碰（"关"= 彻底不与外界交互）；
+        //    "没有令牌"是静默跳过（凭据库四种读空形态都归这一支），不是故障。
+        //    这一读**只当门用、不把值带下去**：令牌由下面的 `refresh_if_needed` 自己再读一次
+        //    （它收 `&dyn TokenStore` 而非 `TokenSet` 正是为此）—— 于是"跳过"与"报错"的分界
+        //    留在本函数，而它内部那条"没有令牌 → Error::Config"只在两次读之间令牌被清掉时
+        //    （登出正巧撞上这一轮）才可能出现。
         if !self.cfg.char.enabled {
             return Ok(None);
         }
-        let Some(tokens) = self.tokens.load()? else {
+        if self.tokens.load()?.is_none() {
             return Ok(None);
-        };
+        }
+        // ② 令牌：**过期才刷**。未过期时 `refresh_if_needed` 原样返回、一个请求都不发；
+        //    过期时它把 `refresh_body` POST 到端点、解析响应、写回凭据库，返回的就是下面要用的
+        //    那一份。端点在生产里必须是官方地址，故由这里显式传常量（桩地址只存在于测试里）。
+        let tokens = crate::sso::refresh::refresh_if_needed(
+            &self.cfg.char.client_id,
+            self.tokens.as_ref(),
+            chrono::Utc::now().timestamp(),
+            crate::sso::refresh::DEFAULT_TOKEN_ENDPOINT,
+        )
+        .await?;
         // 角色身份从**令牌自己**里取（T3B 的纯函数，只解码不验签）：角色 id 必须与这个
         // 令牌同源 —— 让"库里恰好有哪一行 char_meta"来决定同步谁，就是拿 A 的令牌去拉 B 的
         // 订单，而 `fetch_auth` 的缓存键正是 URL 里的这个 id。

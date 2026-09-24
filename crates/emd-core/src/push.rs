@@ -388,6 +388,10 @@ pub async fn dispatch(channels: &[&dyn PushChannel], payload: &AlertPayload) -> 
 /// 今天它就是钉钉一条通道的三个旋钮。`enabled` **默认关**：与 `CharConfig` 同一条纪律 ——
 /// 没配好之前，任何一轮都不该往外发东西（告警照样进提醒中心，但不进群）。
 ///
+/// 写路径有两条，按"谁在写"分：首次配置走 [`PushConfig::save`]（全量，调用方手里本来就有明文）；
+/// UI（T14）改看得见的字段走 [`PushConfig::save_editing`] —— 那条路**不需要密钥明文**，
+/// 于是"回显给 UI 的配置"与"改配置"之间不再夹着一次 `load()` 明文（A4）。
+///
 /// **`Debug` 手写**：webhook 与 secret 都在字段里，derive 出的 Debug 一进日志就是明文。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushConfig {
@@ -432,8 +436,10 @@ impl PushConfig {
         }
     }
 
-    /// 写配置。**拒绝把已打码的值存回来**：`echo()` 交给 UI 的是打码串，UI 若原样回存，
+    /// 写配置（**全量**：webhook/secret/enabled 都取自 `self`）。首次配置走这里。
+    /// **拒绝把已打码的值存回来**：`echo()` 交给 UI 的是打码串，UI 若原样回存，
     /// 库里就躺着一条带 `***` 的假密钥 —— 之后每条推送都 310000，且从配置里看不出毛病。
+    /// 只改看得见的字段（webhook / 开关）时走 [`PushConfig::save_editing`]，那条路不用密钥明文。
     pub fn save(&self, db: &Db) -> Result<()> {
         if looks_masked(&self.webhook) || looks_masked(&self.secret) {
             return Err(Error::Config(
@@ -445,12 +451,46 @@ impl PushConfig {
         db.set_meta(META_PUSH_CONFIG, &raw)
     }
 
-    /// 回显给 UI 的形态：webhook 与 secret **都已打码**（A4：密钥不回明文）。
+    /// **局部改写**：UI（T14）手里只有打码回显与"密钥是否已配"这一个比特，它既拿不到密钥明文，
+    /// 也不该为了翻一个开关去 `load()` 出密钥（A4 禁止），于是"没改"必须能在**类型上**表达 ——
+    /// 这就是 `new_secret: Option<&str>` 存在的理由，三态互不相同：
+    ///
+    /// - `None` —— **原样保留库里的密钥**（只换 webhook、只翻开关走这条；关键词模式下库里本就是空串，也照留）；
+    /// - `Some("")` —— **显式置空**：只用关键词安全设置的机器人是合法配置，不是在表达"没改"；
+    /// - `Some(s)` —— 换新密钥；`s` 里带打码片段一律拒绝，回显值永远进不了库。
+    ///
+    /// 回显里的 webhook 仍是打码的（契约不变），而打码串不携带任何信息、原样存下去只会把 `***`
+    /// 写进库（之后每条都 310000），故"打码 webhook"在这里被解读为**保留库里那条** ——
+    /// "只翻开关"正是靠这一条成立。
+    pub fn save_editing(db: &Db, echo: &PushConfigEcho, new_secret: Option<&str>) -> Result<()> {
+        let stored = Self::load(db)?;
+        let secret = match new_secret {
+            None => stored.secret,
+            Some(s) if looks_masked(s) => {
+                return Err(Error::Config(
+                    "新密钥里含已打码的片段（***）：回显值不能存回来，不改就别传（None）".into(),
+                ))
+            }
+            Some(s) => s.to_string(),
+        };
+        Self {
+            webhook: if looks_masked(&echo.webhook) { stored.webhook } else { echo.webhook.clone() },
+            secret,
+            enabled: echo.enabled,
+        }
+        .save(db)
+    }
+
+    /// 回显给 UI 的形态：webhook 与密钥**都不给明文**（A4：密钥不回明文）。
     /// T14 的回显路径只许用这个，别把 `load()` 的结果直接交给前端。
+    ///
+    /// 密钥只以"已配置 / 未配置"一个比特露面（打码残片也不给）：UI 要改就走
+    /// [`PushConfig::save_editing`] 的 `new_secret`，不改就传 `None` —— 想"回存原值"也没有值可回存。
     pub fn echo(&self) -> PushConfigEcho {
         PushConfigEcho {
             webhook: mask(&self.webhook),
-            secret: mask(&self.secret),
+            // 空串 = 没配（关键词模式也走这里：它的密钥本来就是空串，同样该显示成"未配置"）。
+            secret_set: !self.secret.is_empty(),
             enabled: self.enabled,
         }
     }
@@ -476,12 +516,17 @@ impl PushConfig {
 }
 
 /// 打码后的回显形态（T14 渲染与"配置测试"用）。**这里拿不到明文** —— 打码在构造时就做完了。
+///
+/// 它同时是[`PushConfig::save_editing`]的入参：能被 UI 改的字段在这里都是透明的，
+/// 改不了的（密钥）连残片都不出现。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PushConfigEcho {
-    /// 已中段打码的 webhook；空串 = 没配。
+    /// 已中段打码的 webhook；空串 = 没配。**它也是"没改"的载体**：`save_editing` 见到打码值
+    /// 就保留库里那条（打码串不携带信息，存下去只会把 `***` 写进库）。
     pub webhook: String,
-    /// 已中段打码的 secret；空串 = 没配。
-    pub secret: String,
+    /// 密钥**是否已配置**（明文与打码残片都不给 UI）：要改密钥只有 `save_editing` 的
+    /// `new_secret` 一个入口，不改就传 `None`。
+    pub secret_set: bool,
     pub enabled: bool,
 }
 
@@ -815,11 +860,12 @@ mod tests {
         let dbg = format!("{chan:?}");
         assert!(!dbg.contains(TOKEN) && !dbg.contains(SECRET), "{dbg}");
 
-        // ---- ③ 回显面：交给 UI 的形态里没有明文（T14 只许用这个） ----
+        // ---- ③ 回显面：交给 UI 的形态里没有明文，密钥连打码残片都不露（T14 只许用这个） ----
         let echo = cfg.echo();
         assert!(echo.enabled);
-        assert!(!echo.webhook.contains(TOKEN) && !echo.secret.contains(SECRET), "{echo:?}");
-        assert!(echo.webhook.contains(MASK) && echo.secret.contains(MASK), "{echo:?}");
+        assert!(echo.secret_set, "密钥只以「已配置」这一个比特露面");
+        assert!(!echo.webhook.contains(TOKEN), "{echo:?}");
+        assert!(echo.webhook.contains(MASK), "{echo:?}");
 
         // ---- ④ 日志面：在本测试线程上装抓取用的 subscriber（`with_default` 是线程局部的），
         // 抓"有人随手把配置 `{:?}` 进日志"那一行的现场 —— 这条 callsite 只属于本测试，
@@ -875,10 +921,66 @@ mod tests {
         // 而且从配置面上看不出毛病。
         let echo = cfg.echo();
         assert_eq!(PushConfig::load_echo(&db).unwrap(), echo, "UI 回显路由（读库 + 打码）");
-        assert!(!echo.webhook.contains(TOKEN) && !echo.secret.contains(SECRET), "{echo:?}");
-        let bad = PushConfig { webhook: echo.webhook, secret: echo.secret, enabled: true };
+        assert!(!echo.webhook.contains(TOKEN), "{echo:?}");
+        let bad = PushConfig { webhook: echo.webhook, secret: format!("x{MASK}y"), enabled: true };
         assert!(bad.save(&db).is_err(), "打码串不能回存");
         assert_eq!(PushConfig::load(&db).unwrap(), cfg, "拒绝写入不得留下半份配置");
+    }
+
+    #[test]
+    fn save_editing_keeps_the_stored_secret_unless_told_otherwise() {
+        // 这条盯的是"UI 没有不泄露地改配置的路"这个洞：回显里没有密钥明文（也不该有），
+        // 于是"没改"必须能在类型上表达（`None`）。若把它做成"空串 = 没改"的哨兵，
+        // 用户只是想翻个开关就会把密钥清成空 → 关键词模式 → 310000 一律 ChannelDisabled，
+        // 而报错话术还会去怪机器人（T14 唯一的替代读法 `load()` 是 A4 禁止的明文）。
+        let db = Db::in_memory().unwrap();
+        let webhook = format!("{}?access_token={TOKEN}", dingtalk::WEBHOOK_BASE);
+        let new_webhook = format!("https://oapi.dingtalk.com/robot/send?access_token={TOKEN}new");
+        let want = |webhook: &str, secret: &str, enabled: bool| PushConfig {
+            webhook: webhook.to_string(),
+            secret: secret.to_string(),
+            enabled,
+        };
+        want(&webhook, SECRET, false).save(&db).unwrap();
+
+        // ① 只翻开关（T14 最常见的动作）：回显里只有打码 webhook 与「已配置」这个事实。
+        let mut echo = PushConfig::load_echo(&db).unwrap();
+        assert!(echo.secret_set, "库里配了密钥，回显要说「已配置」");
+        echo.enabled = true;
+        PushConfig::save_editing(&db, &echo, None).unwrap();
+        assert_eq!(
+            PushConfig::load(&db).unwrap(),
+            want(&webhook, SECRET, true),
+            "None = 原样保留库里的密钥；回显里的打码 webhook = 保留库里那条（不是把 *** 存下去）"
+        );
+
+        // ② 只换 webhook：新值以明文（非打码）到达，密钥依旧一个字都没经过 UI 的手。
+        let edited = PushConfigEcho { webhook: new_webhook.clone(), secret_set: true, enabled: true };
+        PushConfig::save_editing(&db, &edited, None).unwrap();
+        assert_eq!(
+            PushConfig::load(&db).unwrap(),
+            want(&new_webhook, SECRET, true),
+            "明文 webhook = 换新值，密钥同时不动"
+        );
+
+        // ③ `Some("")` = **显式置空**（只用关键词安全设置的机器人是合法状态），必须与 None 区分开。
+        PushConfig::save_editing(&db, &edited, Some("")).unwrap();
+        assert_eq!(PushConfig::load(&db).unwrap(), want(&new_webhook, "", true), "Some(\"\") 要真的清掉密钥");
+        assert!(!PushConfig::load_echo(&db).unwrap().secret_set, "清掉之后回显该说「未配置」");
+
+        // ④ `Some(新值)` = 换密钥。
+        let rotated = format!("{SECRET}2");
+        PushConfig::save_editing(&db, &edited, Some(&rotated)).unwrap();
+        assert_eq!(PushConfig::load(&db).unwrap(), want(&new_webhook, &rotated, true));
+
+        // ⑤ 打码值塞进 `Some(...)` 一律拒绝：回显串回存就是"之后每条都 310000"的种子，
+        //    且拒绝时不得留下半份配置。
+        let before = PushConfig::load(&db).unwrap();
+        assert!(PushConfig::save_editing(&db, &edited, Some(MASK)).is_err(), "打码值不许进库");
+        assert_eq!(PushConfig::load(&db).unwrap(), before, "拒绝写入不得留下半份配置");
+
+        // ⑥ 全程走下来库里一次 `***` 都没出现过（打码 webhook 走的是"保留原值"）。
+        assert!(!PushConfig::load(&db).unwrap().webhook.contains(MASK), "打码串永远不入库");
     }
 
     #[test]

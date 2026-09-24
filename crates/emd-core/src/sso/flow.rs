@@ -14,6 +14,8 @@
 //! 脱敏纪律（Global Constraints）：`TokenSet`、`jwt`、`access_token`、授权 `code`、
 //! `code_verifier`、`state` 一律不进日志；本文件只记主机/路径与端口。
 
+use std::ffi::OsString;
+use std::os::windows::process::CommandExt;
 use std::time::Duration;
 
 use base64::Engine;
@@ -176,12 +178,42 @@ async fn exchange_code(client_id: &str, code: &str, verifier: &str) -> Result<To
 /// 第三个参数的空串是 `start` 的窗口标题占位——不给它，URL 会被当成标题而不打开。
 /// 不等待子进程：cmd 转手给 `start` 后立刻退出，等它就是白等一次进程创建。
 fn open_browser(url: &str) -> Result<()> {
+    let mut argv = browser_args(url);
+    // 最后一段是 URL，必须走 `raw_arg` 原样交给 cmd：`Command` 的普通 `.arg()` 按 MSVCRT
+    // 规则处理引号（把 `"` 转义成 `\"`），而 cmd **不认** MSVCRT 那套转义——转义过的引号
+    // 在 cmd 眼里只是普通字符，等于没加引号，URL 又会被裸 `&` 截断。
+    let quoted_url = argv.pop().expect("browser_args 固定 4 段，末段是 URL");
     std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
+        .args(argv)
+        .raw_arg(quoted_url)
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| Error::Config(format!("无法打开系统浏览器完成 SSO 授权：{e}")))?;
     Ok(())
 }
+
+/// `cmd` 的 argv（不含程序名）：`/C start "" "<url>"`。
+///
+/// 单独拆成纯函数是为了让"URL 必须带引号"这条 **cmd 语法约束**能被测试钉住——
+/// 授权 URL 的查询参数全用裸 `&` 分隔，而 `cmd` 在 unquoted `&` 处切分命令行
+/// （连内建命令之后也切），于是 `client_id`/`redirect_uri`/`scope`/`state`/`code_challenge`
+/// 从第一个分隔符起全被丢掉，浏览器打开一个残 URL、用户看到 EVE 报错页、`login` 白等满超时。
+/// 这条只有真机才暴露的缺陷，靠本函数的返回值就能回归（测试不 spawn cmd、不开浏览器）。
+fn browser_args(url: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("/C"),
+        OsString::from("start"),
+        // 空标题占位，见 `open_browser` 的说明。
+        OsString::from(""),
+        OsString::from(format!("\"{url}\"")),
+    ]
+}
+
+/// `CREATE_NO_WINDOW`（`winbase.h`，值 `0x0800_0000`）。`std` 不导出这个常量，自带一份。
+///
+/// GUI 子系统的进程 spawn `cmd` 时会闪出一个控制台黑框；登录是用户手点的动作，
+/// 无端闪窗会被当成程序出错。本进程是 Tauri 外壳（GUI），所以这里必须显式关掉。
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(test)]
 mod tests {
@@ -211,5 +243,31 @@ mod tests {
         assert!(char_from_access_token(&jwt).is_err());
         assert!(char_from_access_token("not-a-jwt").is_err());
         assert!(char_from_access_token("a.b").is_err());
+    }
+
+    /// 回归锚点：授权 URL 里的裸 `&` 会被 cmd 当命令分隔符，URL 必须整体带引号。
+    /// 用真 `authorize_url` 的产物（不是手写的短 URL），这样"带裸 `&`"不是假设而是事实；
+    /// 只断言 argv，不 spawn cmd、不开浏览器。
+    #[test]
+    fn browser_args_quote_wraps_the_url_for_cmd() {
+        let url = authorize_url(
+            "abc123",
+            "http://127.0.0.1:8765/callback",
+            "st-1",
+            "CHALLENGE",
+            SCOPES,
+        );
+        assert!(url.contains('&'), "授权 URL 的查询参数用裸 `&` 分隔（当前 7 个参数 → 6 个 `&`）：{url}");
+
+        let args = browser_args(&url);
+        assert_eq!(args.len(), 4, "固定形态：/C start \"\" <url>");
+        assert_eq!(args[0].to_str().unwrap(), "/C");
+        assert_eq!(args[1].to_str().unwrap(), "start");
+        assert_eq!(args[2].to_str().unwrap(), "", "第三段是 start 的窗口标题占位");
+
+        // 逐字符相等 → 引号是首尾各一个、URL 原样夹在中间、没有任何 `\"` 转义
+        // （cmd 不认 MSVCRT 转义，一旦出现就等于没加引号）。
+        let last = args[3].to_str().unwrap();
+        assert_eq!(last, format!("\"{url}\""), "URL 必须被一对引号包住，否则 cmd 在第一个 & 处截断");
     }
 }

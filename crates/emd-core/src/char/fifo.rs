@@ -3,9 +3,13 @@
 //! **纯函数**：无 DB、无网络、无时钟 —— 窗口由调用方按水位切好，这里只重放。
 //!
 //! 三条口径写在这里（判定侧与卡片口径摘要都按这三条读）：
-//! 1. **均价 = 整窗买入的加权平均**（Σ 数量×单价 ÷ Σ 数量）：买 100@10 + 买 100@20 → 15；
-//!    再卖掉 100，均价**仍是 15**。它回答的是"这批货我平均花多少钱买的"，
-//!    不随卖单成交价跳动。
+//! 1. **均价 = 手上剩余持仓的加权平均**（Σ 剩余数量×批次单价 ÷ Σ 剩余数量）：
+//!    买 100@10 + 买 100@20 → 15（还没卖，剩余就是整窗买入）；卖掉 100 之后 → **20**
+//!    （FIFO 吃掉的是 @10 那批，手里只剩 @20 那批）。它回答的是"我现在拿着的这批货
+//!    花了我多少钱"，所以随持仓走，不随卖单成交价跳动。
+//!    口径取持仓而不是整窗买入均价：判定问的就是手上的货值不值当前挂价，整窗均价会
+//!    **低估**持仓成本，`净额 < 全成本` 更难成立 —— 真亏的那些反而漏报，
+//!    与这个功能存在的理由正相反（spec §4.3 ① 的 `单位全成本` 正是以这个成本起算）。
 //! 2. **数量按 FIFO 消耗**：卖单从最早的批次开始扣，队尾是最近买的那批。
 //! 3. **覆盖不到就标未知**：有卖无买 / 卖超窗内买入 / 卖空（队列被清空）→ `Unknown`。
 //!    未知**不是 0** —— 0 成本会让每一笔卖出都算成亏损，造出满屏假告警
@@ -57,11 +61,9 @@ impl FifoCost {
 /// 一个类型的出货账。
 #[derive(Default)]
 struct Lots {
-    /// 各批次**剩余数量**，队首最早。只记数量：均价口径是整窗买入加权平均（头注释第 1 条），
-    /// 批次价格根本不参与计算，多存一份只会多出一条会漂移的真相。
-    queue: VecDeque<u64>,
-    buy_qty: u64,
-    buy_notional: f64,
+    /// 各批次**剩余数量 + 该批单价**，队首最早。单价必须逐批存：口径是"剩余持仓花多少钱
+    /// 买的"（头注释第 1 条），被 FIFO 消耗掉的那批，它的价格要跟着一起消失。
+    queue: VecDeque<(u64, f64)>,
     /// 窗内覆盖失败过（超卖/卖空）。一次即定：仓位历史已经早于回填窗，
     /// 之后"已知"的那部分不再代表实际持仓，继续用它判定等于用假成本。
     uncovered: bool,
@@ -79,22 +81,21 @@ pub fn fifo_costs(txs: &[WalletTx]) -> HashMap<u32, FifoCost> {
         let lots = book.entry(t.type_id).or_default();
         if t.is_buy {
             if t.quantity > 0 {
-                lots.queue.push_back(t.quantity);
-                lots.buy_qty += t.quantity;
-                lots.buy_notional += t.unit_price * t.quantity as f64;
+                lots.queue.push_back((t.quantity, t.unit_price));
             }
             continue;
         }
 
-        // 卖单：从队首扣数量（先进先出）。
+        // 卖单：从队首扣数量（先进先出）。被扣掉的那批价格随它一起消失 ——
+        // 均价只看剩余持仓（头注释第 1 条），消耗掉的批次不该继续影响成本。
         let mut left = t.quantity;
         while left > 0 {
             match lots.queue.front_mut() {
-                Some(rest) if *rest <= left => {
+                Some((rest, _)) if *rest <= left => {
                     left -= *rest;
                     lots.queue.pop_front();
                 }
-                Some(rest) => {
+                Some((rest, _)) => {
                     *rest -= left;
                     left = 0;
                 }
@@ -116,12 +117,23 @@ pub fn fifo_costs(txs: &[WalletTx]) -> HashMap<u32, FifoCost> {
         .collect()
 }
 
-/// 收口：一次买入都没有（有卖无买）也是未知 —— 那正是 90 天窗的典型形态。
+/// 收口：均价取**剩余持仓**的加权平均 —— FIFO 已经吃掉最早那几批，手上剩的是后面批次，
+/// 它们的价格才是"我现在拿着的这批货花了我多少钱"。队列空（有卖无买 / 卖超 / 卖空 /
+/// 只有 0 数量买入）就是手上没有货，同样是未知而不是 0。
 fn finish(lots: &Lots) -> FifoCost {
-    if lots.uncovered || lots.buy_qty == 0 {
+    if lots.uncovered {
         return FifoCost::unknown();
     }
-    FifoCost::known(lots.buy_notional / lots.buy_qty as f64)
+    let mut held_qty: u64 = 0;
+    let mut held_notional = 0.0;
+    for (rest, price) in &lots.queue {
+        held_qty += *rest;
+        held_notional += *rest as f64 * *price;
+    }
+    if held_qty == 0 {
+        return FifoCost::unknown();
+    }
+    FifoCost::known(held_notional / held_qty as f64)
 }
 
 #[cfg(test)]
@@ -152,8 +164,8 @@ mod fifo_tests {
 
     #[test]
     fn fifo_averages_buys_and_consumes_on_sells() {
-        // 买 100@10、买 100@20 → 持 200，均价 15
-        // 卖 100 → 剩余 100，均价仍 15（FIFO 消耗最早那批）
+        // 买 100@10、买 100@20 → 持 200，均价 15（还没卖，剩余就是整窗买入）
+        // 卖 100 → FIFO 吃掉最早的 @10 那批，手里只剩 @20 那批 → 均价 20
         // 再卖 100 → 清空，成本未知
         let mut txs = vec![
             buy(1, "2026-09-01T00:00:00Z", 100, 10.0),
@@ -161,15 +173,19 @@ mod fifo_tests {
         ];
         let costs = fifo_costs(&txs);
         assert_eq!(costs[&TYPE].source, CostSource::Known);
-        assert_eq!(costs[&TYPE].known_price(), Some(15.0), "未卖之前的整窗买入均价");
+        assert_eq!(
+            costs[&TYPE].known_price(),
+            Some(15.0),
+            "未卖之前剩余 = 整窗买入，均价 15"
+        );
 
         txs.push(sell(3, "2026-09-03T00:00:00Z", 100, 30.0));
         let costs = fifo_costs(&txs);
         assert_eq!(costs[&TYPE].source, CostSource::Known, "还剩 100，窗内覆盖得到");
         assert_eq!(
             costs[&TYPE].known_price(),
-            Some(15.0),
-            "FIFO 消耗的是最早那批的数量，均价口径不随卖单跳动"
+            Some(20.0),
+            "@10 那批被 FIFO 消耗掉，剩余 100 的成本是 @20 那批的价"
         );
 
         txs.push(sell(4, "2026-09-04T00:00:00Z", 100, 30.0));

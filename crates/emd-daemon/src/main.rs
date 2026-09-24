@@ -610,6 +610,23 @@ fn print_probe(rep: &history::ProbeReport) {
     println!("结论：{}", rep.verdict);
 }
 
+/// `round`/`serve` 的调度配置。**char 侧必须显式带进来**：`SchedulerConfig::default()` 里是
+/// `CharConfig::default().enabled = false`，照抄默认值会让每个采集轮静默跳过同步与告警 ——
+/// 没有一条日志解释，用户只看到"永远零告警"（`emd alerts` 自己印的话术是"先跑 serve，每轮
+/// 自动跑一次告警回合"，那句只有在这里带上 char 配置时才成立）。
+///
+/// 拆成纯函数是为了让这条接线能被测试钉住：入参给什么就得到什么，没有第二个默认值能在中间
+/// 把它换掉。**调用点**用哪份 CharConfig（现在是 [`CharConfig::load`]）仍由评审保证 —— 测试
+/// 钉的是"带上之后不会被换掉"，不是"调用点真的带了"。
+fn serve_scheduler_config(region: u32, rounds: Option<u64>, char: CharConfig) -> SchedulerConfig {
+    SchedulerConfig {
+        region_id: region,
+        rounds,
+        char,
+        ..Default::default()
+    }
+}
+
 /// `round` 与 `serve` 共用一条路径：以前跑 `round` 建的库会和 `serve` 不一致
 /// （少枢纽池与站点登记），那样 M1 的验收就测不到真东西。
 ///
@@ -630,11 +647,12 @@ async fn run_scheduler(
             return Ok(());
         }
     };
-    let cfg = SchedulerConfig {
-        region_id: region,
-        rounds,
-        ..Default::default()
-    };
+    // char 侧走**分层配置**（`load` = 库 > env > 默认）：设置页写进库里的
+    // client_id/redirect_uri 与 env 一样能开同步 —— daemon 是关掉 Tauri 窗口之后
+    // 唯一仍在采的进程，只读 env 会让"在界面里配好、关窗口后照常告警"落空。
+    // `SchedulerConfig::default()` 的 char 侧仍是**关闭**的（`CharConfig::default()`），
+    // 所以这里必须显式传（见 [serve_scheduler_config]）。
+    let cfg = serve_scheduler_config(region, rounds, CharConfig::load(&db)?);
     let sched = Scheduler::new(client.clone(), db.clone(), cfg);
     let mut rx = sched.subscribe();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -1106,13 +1124,14 @@ async fn run_alerts(
 /// 回落方案），钉钉只在开关打开且 webhook 填了时进场；本地那条恒回 `Sent`，于是"过闸即记账"
 /// 的口径与 serve 完全一致 —— 也就不存在"拿空通道列表跑一轮"这种形态。
 async fn run_alert_round(client: &Arc<EsiClient>, db: &Arc<Db>) -> Result<()> {
-    // P1：**必须 from_env**。`CharConfig::default()` 的 char 侧是**关闭**的 —— 用它会让
-    // "配了 EMD_CHAR_CLIENT_ID、登录也成功了"的机器每轮静默跳过同步，一条日志都不解释，
-    // 用户看到的是"零告警"。
-    let cfg = CharConfig::from_env();
+    // P1：**必须走分层配置**（`load` = 库 > env > 默认）。`CharConfig::default()` 的 char 侧
+    // 是**关闭**的 —— 用它会让"配了 client_id、登录也成功了"的机器每轮静默跳过同步，一条日志
+    // 都不解释，用户看到的是"零告警"；而只读 env 会让"在设置页配好 client_id"的机器落到
+    // 同一种静默里（T15 收尾发现的那条 Critical）。
+    let cfg = CharConfig::load(db)?;
     if !cfg.enabled {
         println!(
-            "角色同步未启用（EMD_CHAR_CLIENT_ID 未配置，或 EMD_CHAR_SYNC=0）—— 本轮不做判定与推送，只展示本地告警表。"
+            "角色同步未启用（设置页与 EMD_CHAR_CLIENT_ID 都没填 client_id，或 EMD_CHAR_SYNC=0）—— 本轮不做判定与推送，只展示本地告警表。"
         );
         return Ok(());
     }
@@ -1209,7 +1228,9 @@ fn run_char(db: &Db, store: &dyn TokenStore, status: bool, logout: bool) -> Resu
     if !status && logout {
         return Ok(());
     }
-    let cfg = CharConfig::from_env();
+    // `--status` 是排查"为什么什么都没发生"的第一站，开关的取值必须与真正跑回合的
+    // 那两条路径同源（分层配置）：只读 env 会对着刚在设置页填好的 client_id 报"未启用"。
+    let cfg = CharConfig::load(db)?;
     let tokens = store.load()?;
     let links = link_facts(db)?;
     print!("{}", render_char_status(&cfg, tokens.as_ref(), &links, now_unix()));
@@ -1228,13 +1249,13 @@ fn render_char_status(
     now: i64,
 ) -> String {
     let mut out = String::new();
-    out.push_str("挂链状态（EMD_CHAR_* 与系统凭据库）\n");
+    out.push_str("挂链状态（设置页 / EMD_CHAR_* 与系统凭据库）\n");
     out.push_str(&format!(
         "  同步开关：{}\n",
         if cfg.enabled {
             format!("已启用（首启回填窗 {} 天，即同步水位与 FIFO 成本基准的窗外边界）", cfg.backfill_days)
         } else {
-            "未启用（EMD_CHAR_CLIENT_ID 未配置，或 EMD_CHAR_SYNC=0）".to_string()
+            "未启用（设置页与 EMD_CHAR_CLIENT_ID 都没填 client_id，或 EMD_CHAR_SYNC=0）".to_string()
         }
     ));
     match tokens {
@@ -1388,6 +1409,30 @@ mod tests {
     // 把它提到文件头会变成非测试构建下的未使用导入。
     use emd_core::sso::store::MemoryTokenStore;
     use std::time::Duration;
+
+    /// T15 收尾的 Critical：`serve`/`round` 的调度配置必须把 char 配置带进去。
+    /// `SchedulerConfig::default()` 的 char 侧是**关闭**的（`CharConfig::default().enabled = false`），
+    /// 一旦被那个默认值换掉，每个采集轮都会静默跳过同步与告警 —— 所以这里两个方向都钉死：
+    /// 开着的照原样穿过，关着的也不会被"顺手打开"。
+    #[test]
+    fn serve_scheduler_config_carries_the_character_config_through() {
+        let on = CharConfig {
+            client_id: "test-client-id".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let cfg = serve_scheduler_config(10000002, Some(3), on.clone());
+        assert_eq!(cfg.region_id, 10000002);
+        assert_eq!(cfg.rounds, Some(3));
+        assert!(cfg.char.enabled, "入参 enabled=true 不许被默认值换回 false");
+        assert_eq!(cfg.char, on, "char 配置逐字穿过（client_id / redirect_uri / 回填窗）");
+
+        // 关着的那份同样逐字穿过：不能反过来替用户打开（没配凭证之前不该往外发请求）。
+        let off = CharConfig::default();
+        let cfg = serve_scheduler_config(10000043, None, off.clone());
+        assert!(!cfg.char.enabled);
+        assert_eq!(cfg.char, off);
+    }
 
     #[test]
     fn prices_get_three_digit_groups() {

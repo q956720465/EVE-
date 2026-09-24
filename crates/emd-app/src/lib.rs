@@ -183,6 +183,12 @@ pub struct AlertSettings {
     /// 本轮真的会装上的通道名（`local` 恒在；`dingtalk` 只在开关打开且 webhook 填了时在场）。
     /// 让"开关开着但 webhook 还空着"这种"看起来配好了其实不发"的形态一眼可见。
     pub channels: Vec<&'static str>,
+    /// **生效的** SSO `client_id`（分层：库 > env > 空）。原样回显：它在授权页 URL 里本来就可见，
+    /// 不是密钥（"令牌不进出口径"那条纪律只约束令牌）。
+    pub client_id: String,
+    /// **生效的**回调地址。界面拿它显示"要注册成什么"，不再写死一个字面量 ——
+    /// 写死的那份在用户改过回调端口之后会变成一句误导。
+    pub redirect_uri: String,
 }
 
 /// `alert_settings_set` 的入参 DTO。**为什么在命令层自己定义一个**：`PushConfigEcho` 有意只实现
@@ -197,6 +203,13 @@ pub struct AlertSettingsIn {
     pub webhook: String,
     pub secret: Option<String>,
     pub enabled: bool,
+    /// SSO `client_id`（开发者后台注册应用后取）。**空串 = 清掉库里的值**，回落 env / 默认 ——
+    /// 与 `webhook` 的空串语义（改新值）不同：这里没有"密钥不能回存"的问题，
+    /// 输入的每个字都能原样存下去，所以空串就是用户键入内容的字面意思。
+    pub client_id: String,
+    /// 回调地址。空串同上。**必须与开发者后台注册值逐字符一致**（EVE 精确匹配），
+    /// 差的字符不会在这里被拦下，只会让浏览器落到空处 —— 所以界面要把这句话说出来。
+    pub redirect_uri: String,
 }
 
 /// SSO 挂链状态（`sso_status`）。**只回派生的布尔/时刻/身份，令牌原文一个字都不在里面**
@@ -217,7 +230,8 @@ pub struct SsoStatus {
     /// 角色同步开关（`CharConfig.enabled`）：false 时**每个采集轮都静默跳过同步**，
     /// 界面必须把这条说出来，否则用户只能看到"零告警"。
     pub char_sync_enabled: bool,
-    /// `client_id` 是否配了（`EMD_CHAR_CLIENT_ID`）。没配时登录按钮要给出可照着做的下一步。
+    /// 生效的 `client_id` 非空（设置页存的 > `EMD_CHAR_CLIENT_ID` > 空）。没配时登录按钮
+    /// 要给出可照着做的下一步（填哪一栏、回调地址要注册成什么）。
     pub client_id_set: bool,
     /// 令牌在、但解不出角色时的原因（一句能照着查的话；**不含令牌原文** ——
     /// `char_from_access_token` 的报错只带 JWT 段数与字段名）。
@@ -244,10 +258,10 @@ struct AppState {
     /// 令牌来源（M4c）。默认系统凭据库；测试注入内存实现。`sso_status`/`sso_logout`/`sso_login`
     /// 三个命令都只经它读写令牌 —— 这条通路上**没有**任何令牌的落库/日志面。
     tokens: Arc<dyn TokenStore>,
-    /// SSO 与角色同步配置（`CharConfig::from_env()` 归一的那一份）。`sso_login` 的四个参数
-    /// 全部从这里取：`client_id` 与 `redirect_uri` 必须与开发者后台的注册值逐字符一致，
-    /// 不能由代码代猜（EVE 是精确匹配）。
-    cfg: CharConfig,
+    // 这里曾经有一份启动时的 `CharConfig` 快照（`AppState.cfg`）：设置页能配 client_id 之后
+    // 它就成了 bug —— "粘贴 client_id → 点登录"读到的还是启动那一刻的旧值，逼用户重启。
+    // 现在 SSO 两个命令在**命令时**从库里现读（[`AppState::sso_cfg`]）；采集线程那一份仍是
+    // 启动快照（改配置要重启才轮到它，界面上有明说）。
 }
 
 /// 命令体都放这里，`#[tauri::command]` 只做参数拆装。
@@ -577,26 +591,35 @@ impl AppState {
         .await
     }
 
-    /// 通道配置的回显（三个旋钮 + 本轮真会装上的通道名）。
-    /// **只走 `echo()`**：`PushConfig::load` 的明文只给发送器与保存路径用（A4）。
+    /// 配置回显（推送三旋钮 + 本轮真会装上的通道名 + 生效的 SSO 两个非密钥值）。
+    /// **推送侧只走 `echo()`**：`PushConfig::load` 的明文只给发送器与保存路径用（A4）。
     async fn alert_settings(&self) -> Result<AlertSettings, String> {
         read(self.db.clone(), |db| {
             let cfg = PushConfig::load(db).map_err(err)?;
-            Ok(settings_of(&cfg))
+            let char = CharConfig::load(db).map_err(err)?;
+            Ok(settings_of(&cfg, &char))
         })
         .await
     }
 
-    /// 改通道配置。写路径只有 `PushConfig::save_editing` 一条（它是唯一能在**不需要密钥明文**
-    /// 的前提下改配置的入口），保存成功后回一份新的打码回显 —— 面板据此刷新，
-    /// 而不是拿用户输入自己拼（输入里的打码 webhook 与库里的真值不是一回事）。
+    /// 改配置（推送旋钮 + spec §4.1 的 SSO 两个非密钥值）。推送侧写路径只有
+    /// `PushConfig::save_editing` 一条（它是唯一能在**不需要密钥明文**的前提下改配置的入口），
+    /// 保存成功后回一份新的回显 —— 面板据此刷新，而不是拿用户输入自己拼（输入里的打码 webhook
+    /// 与库里的真值不是一回事）。
+    ///
+    /// SSO 两个值走 `CharConfig::save_identity`（落 `meta` KV）：它们是公开值，
+    /// 不需要三态那套（没有"不能回存"的打码串），空串 = 清掉库里的值。
     async fn alert_settings_save(&self, input: AlertSettingsIn) -> Result<AlertSettings, String> {
         // 粘贴到输入框的值首尾常带空格，而 base64 密钥与 webhook URL 都不含合法空白：
         // 原样存下去会让请求 URL/加签串多出空格 → 310000 → 通道被禁用，提示话术却去怪机器人
         // （配置面上看不出任何毛病）。故在入口一次性去净。
         // 只有空白的密钥去净后就是空串 = 显式「清空」（`Some("")`）—— 那正是用户键入内容的字面意思。
+        // client_id / redirect_uri 同理去净：带空格的 redirect_uri 与注册值不逐字符相等，
+        // 而 EVE 是精确匹配 —— 症状同样是"浏览器落到空处、白等满 180 s"。
         let webhook = input.webhook.trim().to_string();
         let secret = input.secret.map(|s| s.trim().to_string());
+        let client_id = input.client_id.trim().to_string();
+        let redirect_uri = input.redirect_uri.trim().to_string();
         read(self.db.clone(), move |db| {
             let echo = PushConfigEcho {
                 // 打码串由 `save_editing` 解读为"保留库里那条"；明文则是新值。
@@ -607,10 +630,22 @@ impl AppState {
                 enabled: input.enabled,
             };
             PushConfig::save_editing(db, &echo, secret.as_deref()).map_err(err)?;
+            CharConfig::save_identity(db, &client_id, &redirect_uri).map_err(err)?;
             let saved = PushConfig::load(db).map_err(err)?;
-            Ok(settings_of(&saved))
+            let char = CharConfig::load(db).map_err(err)?;
+            Ok(settings_of(&saved, &char))
         })
         .await
+    }
+
+    /// SSO 两个命令的配置来源：**命令时现读库**（分层：库 > env > 默认），不是启动快照。
+    ///
+    /// 这是"设置页粘贴 client_id → 点登录，当场生效"的全部依据：拿启动那一刻的旧值去开授权页，
+    /// 用户只会得到一句"没配 client_id"或一个空的 client_id（授权页必然报错），
+    /// 而解决办法居然是"重启应用"—— spec §4.1 让它在设置页可配就没意义了。
+    /// 采集线程那一份仍是启动快照（改配置要重启才轮到采集者，界面上有明说）。
+    async fn sso_cfg(&self) -> Result<CharConfig, String> {
+        read(self.db.clone(), |db| CharConfig::load(db).map_err(err)).await
     }
 
     /// SSO 挂链状态。**派生事实进、派生事实出**：令牌只以"链没链上 / 到期时刻 / 从它解出的
@@ -620,6 +655,9 @@ impl AppState {
     /// 凭据库不可用 / 凭据内容坏了"四种情形收拢成同一件事（store 层刻意如此），
     /// 这里照它的口径如实报"未挂链"即可 —— 报错会让整块面板消失，用户连登录按钮都摸不到。
     async fn sso_status(&self) -> Result<SsoStatus, String> {
+        // 开关与 client_id 都取生效值（库里刚保存的那份立刻算数），否则面板会在用户
+        // 刚填完 client_id 之后仍显示"同步关着"，把人引向一次没必要的重启。
+        let cfg = self.sso_cfg().await?;
         let token = self.tokens_load().await?;
 
         // 角色身份从**令牌自己**里解（与调度器同一判据，`char_from_access_token` 只解码不验签）。
@@ -653,8 +691,8 @@ impl AppState {
             last_sync_at,
             expires_at: token.as_ref().map(|t| t.expires_at),
             token_expired: token.as_ref().map(|t| t.is_expired(now)).unwrap_or(false),
-            char_sync_enabled: self.cfg.enabled,
-            client_id_set: !self.cfg.client_id.trim().is_empty(),
+            char_sync_enabled: cfg.enabled,
+            client_id_set: !cfg.client_id.trim().is_empty(),
             token_error,
         })
     }
@@ -674,9 +712,12 @@ impl AppState {
     /// 必然报错的页面 —— 用户点一次浏览器、等满 180 秒超时，才从"没反应"里猜出是配置没填。
     /// 这里直接把可照着做的那句话给出来。
     async fn sso_login(&self) -> Result<SsoLoginOut, String> {
-        if self.cfg.client_id.trim().is_empty() {
+        // 配置在**命令时**读库：设置页刚保存的 client_id / redirect_uri 必须立刻可用，
+        // 否则"粘贴 → 点登录"只会撞上一句"没配 client_id"，逼用户重启（见 [`Self::sso_cfg`]）。
+        let cfg = self.sso_cfg().await?;
+        if cfg.client_id.trim().is_empty() {
             return Err(
-                "先在设置里配 EMD_CHAR_CLIENT_ID / client_id —— 没有它授权页打不开（开发者后台注册应用后取）"
+                "先在设置页填 client_id（或配 EMD_CHAR_CLIENT_ID）—— 没有它授权页打不开（开发者后台注册应用后取）"
                     .into(),
             );
         }
@@ -684,11 +725,11 @@ impl AppState {
         // 两者不一致时用户会白等满 180 s 只换来一句没提端口与 URI 的超时。
         // 解析失败与上面的空 `client_id` 同一纪律：在打开浏览器**之前**当场拒绝，
         // 错误里带着可照着改的形状。
-        let port = self.cfg.callback_port().map_err(err)?;
+        let port = cfg.callback_port().map_err(err)?;
         // 其余参数全部来自配置、代码不代猜；超时 180 s 是"用户手点授权"的合理上限。
         let out = login(
-            &self.cfg.client_id,
-            &self.cfg.redirect_uri,
+            &cfg.client_id,
+            &cfg.redirect_uri,
             port,
             self.tokens.as_ref(),
             Duration::from_secs(180),
@@ -699,15 +740,19 @@ impl AppState {
     }
 }
 
-/// `PushConfig` → 面板回显（`echo()` 打码 + 本轮真会装上的通道名）。
-/// 抽成一处是为了让"回显"只有一条路径：`load()` 的明文永远不往前端走。
-fn settings_of(cfg: &PushConfig) -> AlertSettings {
+/// `PushConfig` + `CharConfig` → 面板回显（webhook 打码 + 本轮真会装上的通道名 +
+/// SSO 的两个**生效值**）。抽成一处是为了让"回显"只有一条路径：
+/// 推送那半份的 `load()` 明文永远不往前端走；SSO 那半份回的是分层后的生效值
+/// （界面据此显示"要注册成什么"，不再写死字面量）。
+fn settings_of(cfg: &PushConfig, char: &CharConfig) -> AlertSettings {
     let echo = cfg.echo();
     AlertSettings {
         webhook: echo.webhook,
         secret_set: echo.secret_set,
         enabled: echo.enabled,
         channels: cfg.channels().iter().map(|c| c.name()).collect(),
+        client_id: char.client_id.clone(),
+        redirect_uri: char.redirect_uri.clone(),
     }
 }
 
@@ -942,15 +987,17 @@ async fn collect_with_lock(
 
     // `SchedulerConfig::default()` 的 char 侧是**关闭**的（`CharConfig::default().enabled = false`）：
     // 用它的话，用户登录成功之后每一轮都静默跳过同步 —— 一条日志都不解释，界面上只剩"永远零告警"。
-    // 这里必须走 `from_env()`（与 daemon 的 `alerts --update` 同一份归一：EMD_CHAR_CLIENT_ID /
-    // EMD_CHAR_SYNC）。令牌源指向与登录/登出**同一对** keyring 条目：两个常量只在
+    // 这里必须走**分层配置** `CharConfig::load`（库 > env > 默认；与 daemon 的 `alerts --update`
+    // 同一份归一）：设置页里填的 client_id 与 EMD_CHAR_CLIENT_ID 两条路都要能开同步。
+    // **读一次就定下来**（改配置要重启应用才轮到采集者 —— 界面上明说了这一点）。
+    // 令牌源指向与登录/登出**同一对** keyring 条目：两个常量只在
     // `emd_core::scheduler` 定义一次 —— 条目对不上时表现为"登录成功但每轮静默跳过"，
     // 而"没令牌"不是错误，从现象上完全看不出是条目没对上。`KeyringTokenStore` 是无状态句柄
     // （不带缓存），与界面侧那份指向同一条条目，读写的是同一份令牌。
     let sched = Scheduler::new(
         client.clone(),
         db.clone(),
-        SchedulerConfig { char: CharConfig::from_env(), ..Default::default() },
+        SchedulerConfig { char: CharConfig::load(&db).map_err(err)?, ..Default::default() },
     )
     .with_tokens(Arc::new(KeyringTokenStore::new(KEYRING_SERVICE, KEYRING_ACCOUNT)));
 
@@ -1046,9 +1093,6 @@ pub fn run() {
         collector: Arc::new(AtomicBool::new(false)),
         // 界面侧的令牌源与采集线程那份指向同一对 keyring 条目（常量共用一处定义）。
         tokens: Arc::new(KeyringTokenStore::new(KEYRING_SERVICE, KEYRING_ACCOUNT)),
-        // `from_env()` 只在这里读一次：`sso_login` 的 client_id/redirect_uri/端口都取自它，
-        // 运行期不随环境变量再变（与 `EsiConfig::from_env()` 同一先例）。
-        cfg: CharConfig::from_env(),
     };
 
     spawn_collector(

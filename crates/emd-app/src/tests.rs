@@ -123,9 +123,13 @@ fn state(latest: Option<RoundState>) -> AppState {
     state_with(seeded(), latest)
 }
 
-/// 令牌源与 SSO 配置可换的状态：`sso_status`/`sso_logout`/`sso_login` 的测试要在同一份状态上
+/// 令牌源可换的状态：`sso_status`/`sso_logout`/`sso_login` 的测试要在同一份状态上
 /// 注入内存凭据库（真实现在系统凭据库里，测试不许碰用户的凭据）。
-fn state_sso(db: Db, tokens: Arc<dyn TokenStore>, cfg: CharConfig) -> AppState {
+///
+/// SSO 配置**没有**入参了：`sso_login`/`sso_status` 在命令时从库里现读（分层：库 > env > 默认），
+/// 所以测试要喂配置就往 `db` 里写（`CharConfig::save_identity`）—— 写进程环境变量的做法
+/// 会让成败取决于同进程里别的测试有没有在改那对变量。
+fn state_sso(db: Db, tokens: Arc<dyn TokenStore>) -> AppState {
     AppState {
         db: Arc::new(Mutex::new(db)),
         client: Arc::new(EsiClient::new(EsiConfig::default()).unwrap()),
@@ -133,12 +137,11 @@ fn state_sso(db: Db, tokens: Arc<dyn TokenStore>, cfg: CharConfig) -> AppState {
         shutdown: tokio::sync::watch::channel(false).0,
         collector: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tokens,
-        cfg,
     }
 }
 
 fn state_with(db: Db, latest: Option<RoundState>) -> AppState {
-    let mut st = state_sso(db, Arc::new(MemoryTokenStore::default()), CharConfig::default());
+    let mut st = state_sso(db, Arc::new(MemoryTokenStore::default()));
     st.latest = Arc::new(Mutex::new(latest.map(|s| (s, Instant::now()))));
     st
 }
@@ -608,6 +611,19 @@ fn stored_push_config(st: &AppState) -> PushConfig {
     PushConfig::load(&st.db.lock().unwrap()).unwrap()
 }
 
+/// 只调推送旋钮的入参（`enabled` 恒 true，照那些用例的原样）：SSO 两个值留空 ——
+/// 这些用例的库里本来就没有那两项，空串落下去等于"没写过"。SSO 那半边的往返另有专测
+/// （`alert_settings_roundtrip_persists_the_sso_identity`）。
+fn settings_in(webhook: String, secret: Option<String>) -> AlertSettingsIn {
+    AlertSettingsIn {
+        webhook,
+        secret,
+        enabled: true,
+        client_id: String::new(),
+        redirect_uri: String::new(),
+    }
+}
+
 #[tokio::test]
 async fn alert_rows_carry_kind_names_and_notification_history() {
     const CHAR: u64 = 90_000_001;
@@ -712,11 +728,7 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
     //    这是"用户只想开推送"的最常见动作 —— 若把空值/打码值当成新值写下去，
     //    密钥就成了 `***`，之后每条推送 errcode 310000，而配置面上看不出任何毛病。
     let saved = st
-        .alert_settings_save(AlertSettingsIn {
-            webhook: echo.webhook.clone(),
-            secret: None,
-            enabled: true,
-        })
+        .alert_settings_save(settings_in(echo.webhook.clone(), None))
         .await
         .unwrap();
     assert!(saved.enabled && saved.secret_set, "翻开关不得动密钥：{saved:?}");
@@ -727,24 +739,16 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
 
     // ② 换 webhook（明文），密钥同时不动。
     let new_webhook = format!("https://oapi.dingtalk.com/robot/send?access_token={TOKEN}2");
-    st.alert_settings_save(AlertSettingsIn {
-        webhook: new_webhook.clone(),
-        secret: None,
-        enabled: true,
-    })
-    .await
-    .unwrap();
+    st.alert_settings_save(settings_in(new_webhook.clone(), None))
+        .await
+        .unwrap();
     let stored = stored_push_config(&st);
     assert_eq!(stored.webhook, new_webhook, "明文 webhook 是新值");
     assert_eq!(stored.secret, SECRET, "密钥一个字都没经过 UI 的手");
 
     // ③ 显式清空（`Some("")`）：纯关键词模式的机器人是**合法配置**，与"没改"是两件事。
     let saved = st
-        .alert_settings_save(AlertSettingsIn {
-            webhook: new_webhook.clone(),
-            secret: Some(String::new()),
-            enabled: true,
-        })
+        .alert_settings_save(settings_in(new_webhook.clone(), Some(String::new())))
         .await
         .unwrap();
     assert!(!saved.secret_set, "清掉之后回显要说「未配置」");
@@ -752,11 +756,7 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
 
     // ④ 换新密钥。
     let saved = st
-        .alert_settings_save(AlertSettingsIn {
-            webhook: new_webhook.clone(),
-            secret: Some(format!("{SECRET}2")),
-            enabled: true,
-        })
+        .alert_settings_save(settings_in(new_webhook.clone(), Some(format!("{SECRET}2"))))
         .await
         .unwrap();
     assert!(saved.secret_set);
@@ -766,11 +766,7 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
     //    且拒绝时不得留下半份配置。
     let before = stored_push_config(&st);
     let err = st
-        .alert_settings_save(AlertSettingsIn {
-            webhook: new_webhook.clone(),
-            secret: Some("***".to_string()),
-            enabled: true,
-        })
+        .alert_settings_save(settings_in(new_webhook.clone(), Some("***".to_string())))
         .await
         .expect_err("打码串不许进库");
     assert!(err.contains("***"), "要说清拒绝的是什么：{err}");
@@ -779,11 +775,7 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
     // ⑥ 清空 webhook 框 = 摘掉那条通道（明文空串不是打码值，按新值写）：开关开着也不会有
     //    钉钉通道 —— `channels()` 只在 webhook 填了时才装它。
     let saved = st
-        .alert_settings_save(AlertSettingsIn {
-            webhook: String::new(),
-            secret: None,
-            enabled: true,
-        })
+        .alert_settings_save(settings_in(String::new(), None))
         .await
         .unwrap();
     assert_eq!(saved.webhook, "", "空 webhook 回显也是空串");
@@ -792,22 +784,17 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
     // ⑦ 粘贴带首尾空格（常见）：webhook 与密钥都必须在入口去净 —— 空格进了加签串/请求 URL
     //    就是 310000，而配置面上看不出任何毛病。带空格存一次与不带空格存一次，回显逐字符一致。
     let padded = st
-        .alert_settings_save(AlertSettingsIn {
-            webhook: format!("  {new_webhook} \t"),
-            secret: Some(format!(" {SECRET}3 ")),
-            enabled: true,
-        })
+        .alert_settings_save(settings_in(
+            format!("  {new_webhook} \t"),
+            Some(format!(" {SECRET}3 ")),
+        ))
         .await
         .unwrap();
     let stored = stored_push_config(&st);
     assert_eq!(stored.webhook, new_webhook, "webhook 首尾空格去净后入库");
     assert_eq!(stored.secret, format!("{SECRET}3"), "密钥首尾空格同样去净（不是被当成空值清掉）");
     let plain = st
-        .alert_settings_save(AlertSettingsIn {
-            webhook: new_webhook.clone(),
-            secret: None,
-            enabled: true,
-        })
+        .alert_settings_save(settings_in(new_webhook.clone(), None))
         .await
         .unwrap();
     assert_eq!(padded.webhook, plain.webhook, "带空格与不带空格的 webhook 回显必须一致");
@@ -815,11 +802,7 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
     // ⑧ 纯空白密钥（粘贴走样）：去净后就是空串 = 显式「清空」—— 那正是用户键入内容的字面意思；
     //    若把两个空格原样存下去，加签会算出一个错的签名（310000），配置面上却显示「已配置」。
     let saved = st
-        .alert_settings_save(AlertSettingsIn {
-            webhook: new_webhook.clone(),
-            secret: Some("  ".to_string()),
-            enabled: true,
-        })
+        .alert_settings_save(settings_in(new_webhook.clone(), Some("  ".to_string())))
         .await
         .unwrap();
     assert!(!saved.secret_set, "纯空白密钥按「清空」处理");
@@ -828,11 +811,9 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
 
 #[tokio::test]
 async fn sso_status_reports_not_linked_without_a_token() {
-    let st = state_sso(
-        Db::in_memory().unwrap(),
-        Arc::new(MemoryTokenStore::default()),
-        CharConfig::default(),
-    );
+    // 空库 = 分层配置只剩 env 那一层：`EMD_CHAR_CLIENT_ID` 没配（本进程里没人改过它），
+    // 于是 client_id 为空、开关关着 —— 这两条正是"为什么什么都不动"的答案。
+    let st = state_sso(Db::in_memory().unwrap(), Arc::new(MemoryTokenStore::default()));
     let s = st.sso_status().await.unwrap();
     assert!(
         !s.linked,
@@ -842,7 +823,6 @@ async fn sso_status_reports_not_linked_without_a_token() {
     assert!(s.expires_at.is_none() && !s.token_expired);
     assert_eq!(s.last_sync_at, None, "没有角色 id 就没有可查的行键");
     assert!(s.token_error.is_none());
-    // 没配 client_id 的默认态：这两条正是"为什么什么都不动"的答案。
     assert!(!s.char_sync_enabled && !s.client_id_set);
 }
 
@@ -854,15 +834,9 @@ async fn sso_status_reads_the_character_from_the_token_and_never_echoes_it() {
     let store = Arc::new(MemoryTokenStore::default());
     let expires = now_unix() + 3600;
     store.save(&fake_token(expires)).unwrap();
-    let st = state_sso(
-        db,
-        store.clone(),
-        CharConfig {
-            client_id: "test-client-id".into(),
-            enabled: true,
-            ..Default::default()
-        },
-    );
+    // 配置走库（设置页那条路）：`sso_status` 在命令时现读，写进去就该立刻看得见。
+    CharConfig::save_identity(&db, "test-client-id", "http://127.0.0.1:8765/callback").unwrap();
+    let st = state_sso(db, store.clone());
 
     let s = st.sso_status().await.unwrap();
     // 正向证据：身份确实是从**这个**令牌里解出来的（下面的"没有哨兵"才有意义）。
@@ -872,7 +846,12 @@ async fn sso_status_reads_the_character_from_the_token_and_never_echoes_it() {
     assert_eq!(s.expires_at, Some(expires));
     assert!(!s.token_expired, "离过期还有一小时");
     assert_eq!(s.last_sync_at, Some(1_789_000_000), "上次同步来自 char_meta");
-    assert!(s.char_sync_enabled && s.client_id_set);
+    assert!(s.client_id_set, "client_id 来自库里那份（命令时现读）");
+    // 开关按生效的 client_id 重算 —— 光在设置页填 client_id 也必须是"开"，否则采集者
+    // 每轮静默跳过同步与告警（T15 收尾那条 Critical 的同一形态）。`EMD_CHAR_SYNC=0`
+    // 是无条件 kill switch：环境是进程全局的，这里按它判断（本测试二进制不改 env）。
+    let killed = matches!(std::env::var("EMD_CHAR_SYNC").ok().as_deref(), Some("0") | Some("false"));
+    assert_eq!(s.char_sync_enabled, !killed);
     assert!(s.token_error.is_none());
 
     // 要害：整份状态序列化之后**令牌原文一个字都不在**（前端拿到的就是这个 JSON）。
@@ -905,7 +884,7 @@ async fn sso_status_reads_the_character_from_the_token_and_never_echoes_it() {
 async fn sso_logout_clears_the_token_store_and_is_idempotent() {
     let store = Arc::new(MemoryTokenStore::default());
     store.save(&fake_token(now_unix() + 3600)).unwrap();
-    let st = state_sso(Db::in_memory().unwrap(), store.clone(), CharConfig::default());
+    let st = state_sso(Db::in_memory().unwrap(), store.clone());
     assert!(st.sso_status().await.unwrap().linked);
 
     st.sso_logout().await.unwrap();
@@ -922,35 +901,109 @@ async fn sso_login_fails_fast_without_a_client_id() {
     // 没配 client_id 时授权页必然报错：让用户点一次浏览器、白等满 180 秒超时，
     // 再从那句"没反应"里猜是配置没填 —— 所以这里必须当场拒绝并给出可照着做的话。
     // 本测试不打网络、不开浏览器（`login` 根本不会被调用）。
-    let st = state_sso(
-        Db::in_memory().unwrap(),
-        Arc::new(MemoryTokenStore::default()),
-        CharConfig::default(),
+    //
+    // 空库 = 分层配置只剩 env 那一层，所以这条用例的前置条件是**本机没有导出过
+    // `EMD_CHAR_CLIENT_ID`**（导出过就会真的走进 login 的 180 s 等待）。前置条件在这里
+    // 明确断言，别让"开发机的环境泄漏"伪装成一次超时。本测试二进制不写任何环境变量。
+    assert!(
+        std::env::var("EMD_CHAR_CLIENT_ID").unwrap_or_default().trim().is_empty(),
+        "本用例的前提是 EMD_CHAR_CLIENT_ID 未设置"
     );
+    let st = state_sso(Db::in_memory().unwrap(), Arc::new(MemoryTokenStore::default()));
     let err = st.sso_login().await.expect_err("没配 client_id 必须当场拒绝");
-    assert!(err.contains("EMD_CHAR_CLIENT_ID"), "要说清去改哪个键：{err}");
+    assert!(err.contains("client_id"), "要说清去配哪个键：{err}");
+    assert!(err.contains("EMD_CHAR_CLIENT_ID"), "环境变量那条路仍然有效，也要说出来：{err}");
 }
 
+/// 设置页的两个非密钥值走 `alert_settings_get`/`set` 的往返（spec §4.1「设置页可配」）：
+/// 存进去要回显、要落 `meta` KV；**空串 = 清掉库里的值**，回落 env / 默认。
+/// 整个用例不碰进程环境变量 —— 写库、读库。
 #[tokio::test]
-async fn sso_login_fails_fast_when_the_redirect_uri_has_no_explicit_port() {
-    // 绑定端口必须从 `redirect_uri` 派生（EVE 逐字符匹配注册值）：URI 里没有显式端口时，
-    // 若还去绑 `loopback_port`，浏览器会落到空处、用户白等满 180 秒只换来一句没提端口与 URI
-    // 的「SSO 登录超时」—— 所以这里必须与空 client_id 同一纪律：在打开浏览器之前当场拒绝。
-    // 本测试不打网络、不开浏览器（`login` 根本不会被调用；真走进去至少要等 180 s，跑不到这里）。
-    let st = state_sso(
-        Db::in_memory().unwrap(),
-        Arc::new(MemoryTokenStore::default()),
-        CharConfig {
-            client_id: "test-client-id".into(),
-            redirect_uri: "http://127.0.0.1/callback".into(),
-            enabled: true,
-            ..Default::default()
-        },
-    );
+async fn alert_settings_roundtrip_persists_the_sso_identity() {
+    let db = Db::in_memory().unwrap();
+    let env = CharConfig::from_env();
+    let st = state_with(db, None);
+
+    // 起手回显的是 env 那一层（库里什么都没写过）。
+    let before = st.alert_settings().await.unwrap();
+    assert_eq!(before.client_id, env.client_id);
+    assert_eq!(before.redirect_uri, env.redirect_uri);
+
+    // 保存（与推送旋钮同一个入口）：两个值当场能回读，且真的落在 meta KV 里。
+    let saved = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: before.webhook.clone(),
+            secret: None,
+            enabled: before.enabled,
+            client_id: "  emd-client-id-1  ".into(),
+            redirect_uri: " http://127.0.0.1:9123/callback ".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.client_id, "emd-client-id-1", "首尾空格在入口去净（带空格的 URI 与注册值不逐字符相等）");
+    assert_eq!(saved.redirect_uri, "http://127.0.0.1:9123/callback");
+    let meta = |k: &str| st.db.lock().unwrap().get_meta(k).unwrap();
+    assert_eq!(meta("char_client_id").as_deref(), Some("emd-client-id-1"));
+    assert_eq!(meta("char_redirect_uri").as_deref(), Some("http://127.0.0.1:9123/callback"));
+
+    // 再读一次（新命令、新查询）：设置页保存完刷新面板看到的就是这份。
+    let again = st.alert_settings().await.unwrap();
+    assert_eq!(again.client_id, "emd-client-id-1");
+    assert_eq!(again.redirect_uri, "http://127.0.0.1:9123/callback");
+
+    // 空串 = 清掉库里的值：回显与 `meta` 都回落 env / 默认。
+    let cleared = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: again.webhook.clone(),
+            secret: None,
+            enabled: again.enabled,
+            client_id: String::new(),
+            redirect_uri: "   ".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cleared.client_id, env.client_id, "清空后回落 env");
+    assert_eq!(cleared.redirect_uri, env.redirect_uri);
+    assert_eq!(meta("char_client_id").as_deref(), Some(""));
+    assert_eq!(meta("char_redirect_uri").as_deref(), Some(""));
+
+    // 清空那次不能把推送配置带坏（同一个入口一起写，谁也别踩谁）。
+    assert_eq!(cleared.webhook, before.webhook, "打码回显原样回存 = 保留库里的 webhook");
+}
+
+/// SSO 两个命令在**命令时**读库（不是启动快照）：设置页刚保存的值要能立刻用上 ——
+/// 这正是"粘贴 client_id → 点登录，不用重启"的全部依据；反过来说，若命令读的还是旧快照，
+/// 症状是"保存了也登不上"，且没有任何提示指向重启。
+#[tokio::test]
+async fn sso_commands_read_the_stored_identity() {
+    let db = Db::in_memory().unwrap();
+    // 先存一个畸形回调（有 scheme 但没有显式端口）：`sso_login` 必须在**开浏览器之前**
+    // 当场拒绝并点名去改哪个键。若命令读的是启动快照/默认值（默认 URI 端口齐全），
+    // 它就会真的走进 login 的回环等待（≥180 s）—— 所以"当场返回"本身就是"读到了库里的值"的证据。
+    CharConfig::save_identity(&db, "stored-client-id", "http://127.0.0.1/callback").unwrap();
+    let st = state_sso(db, Arc::new(MemoryTokenStore::default()));
+
+    let cfg = st.sso_cfg().await.unwrap();
+    assert_eq!(cfg.client_id, "stored-client-id", "命令路径看到库里的 client_id");
+    assert_eq!(cfg.redirect_uri, "http://127.0.0.1/callback", "以及库里的回调地址");
+    assert!(st.sso_status().await.unwrap().client_id_set, "面板据此启用登录按钮");
+
     let started = Instant::now();
     let err = st.sso_login().await.expect_err("URI 没有显式端口必须当场拒绝");
     assert!(err.contains("EMD_CHAR_REDIRECT_URI"), "要说清去改哪个键：{err}");
     assert!(err.contains("http://127.0.0.1:8765/callback"), "要给出可照着改的形状：{err}");
     assert!(!err.contains("超时"), "不许走进 login 的那 180 s 等待：{err}");
     assert!(started.elapsed() < Duration::from_secs(5), "必须当场返回，不能进入 login 的回环等待");
+
+    // 换一个**合法**的回调地址再读：端口跟着生效值走（默认值那个 8765 不再出现），
+    // 报错形状也随之改变 —— 库里换一次，命令路径看到一次。
+    CharConfig::save_identity(
+        &st.db.lock().unwrap(),
+        "stored-client-id",
+        "http://127.0.0.1:9123/callback",
+    )
+    .unwrap();
+    let cfg = st.sso_cfg().await.unwrap();
+    assert_eq!(cfg.callback_port().unwrap(), 9123, "端口从生效的 redirect_uri 现算");
+    assert_ne!(cfg.redirect_uri, CharConfig::default().redirect_uri, "已不是默认那个字面量");
 }

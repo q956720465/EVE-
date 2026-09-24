@@ -110,12 +110,18 @@ export default function AlertCenter() {
   const [enabled, setEnabled] = useState(false);
   const [secret, setSecret] = useState("");
   const [clearSecret, setClearSecret] = useState(false);
+  // SSO 的两个非密钥值（spec §4.1 的设置页可配）。回显的是**生效值**（库 > env > 默认），
+  // 空串保存 = 清掉库里的值、回落 env/默认 —— 与密钥框的"留空 = 不改"是两回事，故不复用三态。
+  const [clientId, setClientId] = useState("");
+  const [redirectUri, setRedirectUri] = useState("");
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     if (settings && !dirty) {
       setWebhook(settings.webhook);
       setEnabled(settings.enabled);
+      setClientId(settings.client_id);
+      setRedirectUri(settings.redirect_uri);
       // 密钥框永远是空的：库里那份明文从不回前端，用户不填就是不填。
       setSecret("");
       setClearSecret(false);
@@ -126,15 +132,20 @@ export default function AlertCenter() {
     // 三态映射（**这里就是那个坑**）：留空且没勾"清除" = 不改密钥（undefined）；
     // 勾了清除 = 显式清空（空串）；填了值 = 换新密钥。
     const secretIn = clearSecret ? "" : secret.trim() === "" ? undefined : secret;
-    void saveSettings({ webhook, secret: secretIn, enabled }).then((ok) => {
-      // 只有真保存成功才清 dirty：失败时保持脏标记与用户输入，
-      // 否则后端拒绝会被回显覆盖成"已保存"的假象。
-      if (ok) {
-        setDirty(false);
-        setSecret("");
-        setClearSecret(false);
-      }
-    });
+    void saveSettings({ webhook, secret: secretIn, enabled, client_id: clientId, redirect_uri: redirectUri }).then(
+      (ok) => {
+        // 只有真保存成功才清 dirty：失败时保持脏标记与用户输入，
+        // 否则后端拒绝会被回显覆盖成"已保存"的假象。
+        if (ok) {
+          setDirty(false);
+          setSecret("");
+          setClearSecret(false);
+          // 保存后立刻回读挂链状态：`client_id_set` / 开关都是后端按库里的新值算的，
+          // 不回读的话"刚填完 client_id，登录按钮还是灰的"，看起来像没保存成功。
+          void loadSso();
+        }
+      },
+    );
   }
 
   const rows = alerts ?? [];
@@ -216,27 +227,68 @@ export default function AlertCenter() {
               {/* "为什么什么都不动"的两条：开关关着 / client_id 没配。不写出来，用户只能看到零告警。 */}
               {!sso.char_sync_enabled && (
                 <div className="hint small">
-                  角色同步<b>关着</b>（EMD_CHAR_CLIENT_ID 未配置，或 EMD_CHAR_SYNC=0）：每个采集轮都会静默跳过
-                  同步与告警判定。配置后重启应用生效。
+                  角色同步<b>关着</b>（client_id 没填，或 EMD_CHAR_SYNC=0）：每个采集轮都会静默跳过
+                  同步与告警判定。
                 </div>
               )}
               {!sso.client_id_set && (
                 <div className="hint small">
-                  没有 client_id 就打不开授权页：先在开发者后台注册应用（回环地址要注册成
-                  http://127.0.0.1:8765/callback），再把 EMD_CHAR_CLIENT_ID 配好。
+                  没有 client_id 就打不开授权页：先在 EVE 开发者后台注册应用（回调地址要注册成{" "}
+                  <b>{settings?.redirect_uri || "读配置中…"}</b>），再把它填进下面这一栏。
                 </div>
               )}
               {sso.token_error && (
                 <div className="hint small">令牌读到了但解不出角色：{sso.token_error}（重新登录即可）</div>
               )}
+              {/* 设置页可配（spec §4.1）：注册完应用把两个值粘进来即可，不必再设环境变量。
+                  两句话都有"为什么"：URI 是精确匹配（差一个字符浏览器就落到空处、白等到超时）；
+                  生效时机分两种（登录当场读库，采集者只读启动那一刻的快照）。 */}
+              <label className="field">
+                client_id（开发者后台注册应用后取）
+                <input
+                  value={clientId}
+                  onChange={(e) => {
+                    setClientId(e.target.value);
+                    setDirty(true);
+                  }}
+                  placeholder="EVE 开发者应用的 Client ID"
+                  title="与开发者后台的 Client ID 逐字符一致；它出现在授权页 URL 里，不是密钥"
+                />
+              </label>
+              <label className="field">
+                回调地址 redirect_uri
+                <input
+                  value={redirectUri}
+                  onChange={(e) => {
+                    setRedirectUri(e.target.value);
+                    setDirty(true);
+                  }}
+                  placeholder="http://127.0.0.1:8765/callback"
+                  title="必须与开发者后台注册的回调地址逐字符一致（含端口）：EVE 是精确匹配，差一个字符浏览器就落到空处"
+                />
+              </label>
+              <div className="hint small">
+                回调地址必须与开发者后台注册值<b>逐字符一致</b>（含端口）—— 差一个字符，浏览器就落到空处、
+                登录白等到超时。两个值清空保存 = 清掉本机库里存的那份，回落环境变量 / 默认值。
+                <br />
+                生效时机：<b>登录当场生效</b>（命令在点下去那一刻读库）；<b>角色同步与首启回填窗要重启应用
+                </b>才轮到采集者用上新配置（它只读启动那一刻的快照）。
+              </div>
               <div className="row-actions">
+                <button
+                  className={dirty ? "on" : ""}
+                  onClick={save}
+                  title="与推送配置同一个保存入口：写库后回读；client_id / 回调地址当场（登录时）生效"
+                >
+                  {dirty ? "保存配置（有未保存改动）" : "保存配置"}
+                </button>
                 <button
                   onClick={() => void loginSso()}
                   disabled={ssoBusy || !sso.client_id_set}
                   title={
                     sso.client_id_set
                       ? "打开系统浏览器完成 EVE 授权（最长等 180 秒），令牌只落系统凭据库"
-                      : "先配 EMD_CHAR_CLIENT_ID：没有它授权页必然报错"
+                      : "先在下面填 client_id：没有它授权页必然报错"
                   }
                 >
                   {ssoBusy ? "等待授权…" : "登录 EVE SSO"}
@@ -350,8 +402,8 @@ export default function AlertCenter() {
         <div className="empty">读取中…</div>
       ) : rows.length === 0 ? (
         <div className="empty">
-          还没有任何告警。前提有三条：① 配好 EMD_CHAR_CLIENT_ID 并登录；② 跑采集（
-          <span className="dim">ember serve</span> 或让本窗口持有采集锁）；③ 判定面里真的有亏损
+          还没有任何告警。前提有三条：① 在上面填好 client_id 并登录；② 跑采集（
+          <span className="dim">emd serve</span> 或让本窗口持有采集锁）；③ 判定面里真的有亏损
           —— 成本未知的类型整个不参与判定（拿 0 当成本会造出满屏假告警）。
         </div>
       ) : (

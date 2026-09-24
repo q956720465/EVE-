@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::store::Db;
 
 /// 令牌成本：实测 `X-Ratelimit-Used` 逐条验证 —— 2xx=2、3xx=1、4xx=5、5xx=0。
 pub mod cost {
@@ -120,6 +121,23 @@ impl Default for CharConfig {
     }
 }
 
+/// `meta` KV 里存这两个非密钥值的键（照 `push_config` 的先例：不建表、不加迁移）。
+///
+/// **它们不是密钥**：OAuth 原生应用的 `client_id` 本来就出现在授权页 URL 里，
+/// `redirect_uri` 更是要拿去开发者后台注册的公开值。真正的秘密（令牌）只住系统凭据库，
+/// "令牌不进 DTO/日志"那条纪律一个字都不动。
+const META_CHAR_CLIENT_ID: &str = "char_client_id";
+const META_CHAR_REDIRECT_URI: &str = "char_redirect_uri";
+
+/// `EMD_CHAR_SYNC` 的 kill switch（`0`/`false` 关闭）。单列成函数是因为 [`CharConfig::load`]
+/// 在覆盖完库里的 `client_id` 之后要重算开关 —— 归一判定只能有一份，两份早晚漂移。
+fn sync_killed_by_env() -> bool {
+    matches!(
+        std::env::var("EMD_CHAR_SYNC").ok().as_deref(),
+        Some("0") | Some("false")
+    )
+}
+
 impl CharConfig {
     /// 运行期归一：配了 `client_id` 才算"用户显式启用"，`EMD_CHAR_SYNC=0` 无条件关闭
     /// （照 `EMD_XREGION` 的先例 —— 默认值不走 env，测试不被环境左右）。
@@ -133,17 +151,46 @@ impl CharConfig {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(d.redirect_uri);
-        let enabled = match std::env::var("EMD_CHAR_SYNC").ok().as_deref() {
-            Some("0") | Some("false") => false,
-            Some("1") | Some("true") => !client_id.is_empty(),
-            _ => !client_id.is_empty(),
-        };
+        let enabled = !sync_killed_by_env() && !client_id.trim().is_empty();
         Self {
             client_id,
             redirect_uri,
             enabled,
             ..d
         }
+    }
+
+    /// 分层配置（spec §4.1 的"设置页可配"）：`from_env()` 起底，再用 `meta` KV 里**非空**的值
+    /// 覆盖 —— **库里 > env > 默认**：入库存的是用户在设置页的显式输入，优先级高于环境变量；
+    /// 空串/没写过 = 不覆盖（回落 env / 默认），也就是"清掉库里的值"。
+    ///
+    /// 开关按**生效的** `client_id` 重算：`from_env` 只按 env 里的 client_id 判开——只用设置页
+    /// 填了 client_id 的机器上，采集者仍是"关"，每个采集轮静默跳过同步与告警（T15 收尾发现
+    /// 的那条 Critical 的同一形态）。`EMD_CHAR_SYNC=0` 仍是无条件 kill switch。
+    ///
+    /// 读库失败只 warn 并回落 env（照 `PushConfig::load`：配置面坏掉不该把整个告警回合点崩；
+    /// 落回 env 只会少同步，不会误同步）。
+    pub fn load(db: &Db) -> Result<Self> {
+        let mut cfg = Self::from_env();
+        match db.get_meta(META_CHAR_CLIENT_ID) {
+            Ok(Some(v)) if !v.trim().is_empty() => cfg.client_id = v,
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "读 char_client_id 失败，回落为环境变量"),
+        }
+        match db.get_meta(META_CHAR_REDIRECT_URI) {
+            Ok(Some(v)) if !v.trim().is_empty() => cfg.redirect_uri = v,
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "读 char_redirect_uri 失败，回落为环境变量"),
+        }
+        cfg.enabled = !sync_killed_by_env() && !cfg.client_id.trim().is_empty();
+        Ok(cfg)
+    }
+
+    /// 把设置页的两个非密钥值写进 `meta` KV。**空串照写**：读取侧只覆盖非空值，于是
+    /// "库里是空串"与"没写过"是同一件事 —— 那正是 UI 的「清空 = 回落 env/默认」。
+    pub fn save_identity(db: &Db, client_id: &str, redirect_uri: &str) -> Result<()> {
+        db.set_meta(META_CHAR_CLIENT_ID, client_id)?;
+        db.set_meta(META_CHAR_REDIRECT_URI, redirect_uri)
     }
 
     /// 从 `redirect_uri` 里解出回调端口（`scheme://host:port/path` 的 authority 段那个显式端口）。
@@ -270,6 +317,39 @@ mod tests {
             };
             assert!(cfg.callback_port().is_err(), "形状不对必须报错：{bad}");
         }
+    }
+
+    /// 分层加载（spec §4.1「设置页可配」的存储层）：库里的非空值赢过 env，空/缺回落 env。
+    ///
+    /// **本测试不碰进程环境变量**（同进程里 `char_switch_...` 那条在改 `EMD_CHAR_*`，
+    /// 断言一旦依赖 env 的具体取值，就变成"成败取决于别的测试有没有正好在改环境变量"）。
+    /// 于是比较对象取**本测试开头那一份** `from_env()` 快照：env 里有什么都不影响断言方向。
+    #[test]
+    fn layered_load_prefers_stored_values_and_falls_back_to_env() {
+        let db = Db::in_memory().unwrap();
+        let env = CharConfig::from_env();
+
+        // 什么都没写过 = 完全等于 env 那一层。
+        assert_eq!(CharConfig::load(&db).unwrap(), env);
+
+        // 库里写了非空值：它就是生效值，与 env 里那份无关。
+        CharConfig::save_identity(&db, "stored-client", "http://127.0.0.1:9999/cb").unwrap();
+        let cfg = CharConfig::load(&db).unwrap();
+        assert_eq!(cfg.client_id, "stored-client", "库里的值赢过 env");
+        assert_eq!(cfg.redirect_uri, "http://127.0.0.1:9999/cb");
+        assert_eq!(cfg.callback_port().unwrap(), 9999, "端口跟着生效的 redirect_uri 走");
+
+        // 空串 = 清掉库里的值，回落 env；两个键各自独立（清一个不动另一个）。
+        CharConfig::save_identity(&db, "", "").unwrap();
+        assert_eq!(CharConfig::load(&db).unwrap(), env, "清空后回落 env/默认");
+        CharConfig::save_identity(&db, "only-id", "").unwrap();
+        let half = CharConfig::load(&db).unwrap();
+        assert_eq!(half.client_id, "only-id");
+        assert_eq!(half.redirect_uri, env.redirect_uri, "没写过的那个键回落 env");
+
+        // 纯空白与空串同义（设置页的去空白在入口做，这里兜住手改库的形态）。
+        CharConfig::save_identity(&db, "   ", "  ").unwrap();
+        assert_eq!(CharConfig::load(&db).unwrap(), env);
     }
 
     #[test]

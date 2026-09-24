@@ -227,13 +227,20 @@ export interface AlertRow {
   payload: string;
 }
 
-/** 通道配置的回显（emd-app::AlertSettings）：webhook 已打码，密钥只有"是否已配置"。 */
+/** 配置回显（emd-app::AlertSettings）：webhook 已打码，密钥只有"是否已配置"。 */
 export interface AlertSettings {
   webhook: string;
   secret_set: boolean;
   enabled: boolean;
   /** 本轮真会装上的通道名（local 恒在；dingtalk 需开关 + webhook）。 */
   channels: string[];
+  /**
+   * **生效的** SSO client_id（分层：设置页存的库值 > EMD_CHAR_CLIENT_ID > 空）。
+   * 公开值，原样回显（它本来就出现在授权页 URL 里）。
+   */
+  client_id: string;
+  /** **生效的**回调地址。界面拿它显示"要注册成什么"，不再写死字面量。 */
+  redirect_uri: string;
 }
 
 /** `alert_settings_set` 的入参。secret 的三态就是 Rust 侧 `save_editing` 的三态。 */
@@ -243,6 +250,10 @@ export interface AlertSettingsIn {
   /** 缺省/undefined = 不改密钥；"" = 显式清空；非空 = 换新密钥。 */
   secret?: string | null;
   enabled: boolean;
+  /** 空串 = 清掉库里的值，回落 env / 默认（与 webhook 的空串语义不同，这里没有"打码回存"问题）。 */
+  client_id: string;
+  /** 空串同上。必须与开发者后台注册的回调地址**逐字符一致**（EVE 精确匹配）。 */
+  redirect_uri: string;
 }
 
 /** SSO 挂链状态（emd-app::SsoStatus）。**里面没有任何令牌文本**。 */

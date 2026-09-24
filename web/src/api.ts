@@ -560,13 +560,21 @@ const FIX_ALERTS: AlertRow[] = [
   },
 ];
 
-/** 预览内存里的通道配置（真机上的那份住在 meta KV 里）。 */
+/**
+ * 预览内存里的配置（真机上那份住在 meta KV 里）。
+ * 回调地址用 `CharConfig::default()` 的那个字面量：它是"库里没写、env 也没配"时的生效值，
+ * 界面上要显示"要注册成什么"时看到的就是它。
+ */
+const FIX_CHAR_DEFAULT_REDIRECT = "http://127.0.0.1:8765/callback";
+
 let fixSettings: AlertSettings = {
   // 已中段打码的 webhook（形态照 `emd_core::push::mask`：头 ≤32 + `***` + 尾 ≤4）。
   webhook: "https://oapi.dingtalk.com/robot/s***9f3a",
   secret_set: true,
   enabled: true,
   channels: ["local", "dingtalk"],
+  client_id: "emd-preview-client-id",
+  redirect_uri: FIX_CHAR_DEFAULT_REDIRECT,
 };
 
 /**
@@ -578,6 +586,9 @@ let fixSsoLinked = true;
 
 function fixSsoStatus(): SsoStatus {
   const fresh = Math.floor(Date.now() / 1000);
+  // client_id 与开关都从预览配置里派生：在设置页里清空 client_id 之后，面板该显示"同步关着"
+  // —— 这两种形态都要能在浏览器里走查（真机上同样由 Rust 的分层配置算出来）。
+  const configured = fixSettings.client_id.trim() !== "";
   return {
     linked: fixSsoLinked,
     char_id: fixSsoLinked ? FIX_CHAR_ID : null,
@@ -585,8 +596,8 @@ function fixSsoStatus(): SsoStatus {
     last_sync_at: fixSsoLinked ? fresh - 95 : null,
     expires_at: fixSsoLinked ? fresh + 960 : null,
     token_expired: false,
-    char_sync_enabled: true,
-    client_id_set: true,
+    char_sync_enabled: configured,
+    client_id_set: configured,
     token_error: null,
   };
 }
@@ -610,11 +621,17 @@ function fixMask(s: string): string {
 function fixSaveSettings(input: AlertSettingsIn): AlertSettings {
   const webhook = input.webhook.includes("***") ? fixSettings.webhook : fixMask(input.webhook.trim());
   const secret_set = input.secret === undefined || input.secret === null ? fixSettings.secret_set : input.secret !== "";
+  // SSO 两值要镜像"空串 = 清掉库里的值、回落 env/默认"这条语义（预览里那层默认就是
+  // `CharConfig::default()` 的 redirect_uri）：真机上这一层由 Rust 的 `CharConfig::load` 决定。
+  const client_id = input.client_id.trim();
+  const redirect_uri = input.redirect_uri.trim() || FIX_CHAR_DEFAULT_REDIRECT;
   fixSettings = {
     webhook,
     secret_set,
     enabled: input.enabled,
     channels: input.enabled && webhook.trim() !== "" ? ["local", "dingtalk"] : ["local"],
+    client_id,
+    redirect_uri,
   };
   return fixSettings;
 }

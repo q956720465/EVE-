@@ -1,21 +1,28 @@
 import { useEffect, useRef, useState } from "react";
 import * as echarts from "echarts/core";
-import { BarChart, CandlestickChart } from "echarts/charts";
-import { DataZoomComponent, GridComponent, TooltipComponent } from "echarts/components";
+import { BarChart } from "echarts/charts";
+import { DataZoomComponent, GridComponent, LegendComponent, TooltipComponent } from "echarts/components";
 import { CanvasRenderer } from "echarts/renderers";
 import { api } from "../api";
 import { DOWN, fmtPrice, fmtVol, UP } from "../format";
 import type { HistoryBar } from "../types";
 
-// 按需注册：整包 echarts 会把体积翻几倍，这里只挂蜡烛图这条链路用到的部件。
-echarts.use([BarChart, CandlestickChart, DataZoomComponent, GridComponent, TooltipComponent, CanvasRenderer]);
+// 按需注册：整包 echarts 会把体积翻几倍，这里只挂柱状图这条链路用到的部件。
+// LegendComponent 不能省：树摇构建下没注册的组件配置会被静默丢弃（复验抓到过 legend 写了不渲染）。
+echarts.use([BarChart, DataZoomComponent, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
+
+// 区间就三档，中文直书。"年"取上游滚动窗口实测上限 418 天（附录 A.4），不装作更长。
+const RANGES = [
+  { key: "日", label: "近几天", days: 7 },
+  { key: "月", label: "近一月", days: 30 },
+  { key: "年", label: "近一年", days: 418 },
+] as const;
 
 /**
- * 单类型日线蜡烛图。ESI 的 history 只有 `(region, type)` 维度、没有站点维度，
- * 所以这张图永远是"该星域均价的时间序列"，不能拿来比较站点（方案 §3.3）。
- *
- * 一张图画完全部本地历史（上游窗口最多 418 天）：不再做 1W/1M 区间按钮，
- * 看局部用图下方的缩放滑块拖选、图上滚轮平移即可。
+ * 单类型日线柱状图（用户指定：不要蜡烛、不要滑块，只要蓝/红柱子）。
+ * 配色沿用全站买卖口径：蓝 = 当天买一（卖出目标价），红 = 当天卖一（买入成本）。
+ * ESI 的 history 只有 `(region, type)` 维度、无站点维度（方案 §3.3），
+ * 图上永远是"该星域日均价的时间序列"，不能拿来比较站点。
  */
 export default function HistoryChart({ typeId }: { typeId: number }) {
   // callback ref：容器随"有无数据"分支挂载/卸载，useRef 拿不到重挂后的节点。
@@ -27,6 +34,7 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
     bars: [],
     loading: true,
   });
+  const [range, setRange] = useState<(typeof RANGES)[number]>(RANGES[2]);
   const [name, setName] = useState("");
   const { bars, loading } = data;
 
@@ -57,7 +65,7 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
 
   useEffect(() => {
     if (!box) return;
-    // 实例只建一次；切区间走 setOption 增量更新，重建会把交互态整个抹掉。
+    // 实例只建一次；切区间走 setOption 增量更新。
     chart.current = chart.current ?? echarts.init(box);
     // 换类型进入 loading 时先 clear：否则"读取历史…"会盖在上一个类型的旧图上。
     if (loading) {
@@ -65,73 +73,60 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
       return;
     }
 
-    // 一张图装全部：只滤掉无均价的日子，不再按窗口截断。
-    const rows = bars.filter((b) => b.average !== null);
+    const from = new Date();
+    from.setUTCDate(from.getUTCDate() - range.days);
+    const fromStr = from.toISOString().slice(0, 10);
+    const rows = bars.filter((b) => b.date >= fromStr && b.average !== null);
 
     const cats = rows.map((b) => b.date);
-    // ECharts 蜡烛的数据序是 [open, close, lowest, highest]；
-    // 日线没有 OHLC，按方案 §6：open = 昨日 average，close = 当日 average。
-    const kline = rows.map((b, i) => [
-      rows[i - 1]?.average ?? b.average ?? 0,
-      b.average ?? 0,
-      b.lowest ?? b.average ?? 0,
-      b.highest ?? b.average ?? 0,
-    ]);
-    const vols = rows.map((b) => b.volume);
+    const bids = rows.map((b) => b.lowest ?? b.average ?? 0);
+    const asks = rows.map((b) => b.highest ?? b.average ?? 0);
 
     chart.current.setOption({
       animationDuration: 300,
-      // 默认 tooltip 是亮色主题：白底一块扣在深色三栏上，且给的是英文
-      // open/close/lowest/highest 三位小数 —— 和全站口径全对不上。
+      legend: {
+        data: ["买一", "卖一"],
+        textStyle: { color: "#cfd8dd", fontSize: 11 },
+        top: 0,
+        right: 8,
+      },
+      // 默认 tooltip 是亮色主题：白底一块扣在深色三栏上 —— 统一深底中文。
       tooltip: {
         trigger: "axis",
-        axisPointer: { type: "cross", label: { show: false } },
         backgroundColor: "rgba(19,26,32,0.95)",
         borderColor: "#253138",
         textStyle: { color: "#cfd8dd", fontSize: 12 },
         formatter: (ps: unknown) => {
-          const first = (ps as { dataIndex: number }[])[0];
-          if (!first) return "";
-          const r = rows[first.dataIndex];
+          const list = (ps as { dataIndex: number }[]) ?? [];
+          const r = list[0] ? rows[list[0].dataIndex] : undefined;
           if (!r) return "";
-          const open = Number(kline[first.dataIndex]?.[0] ?? r.average ?? 0);
-          const up = (r.average ?? 0) >= open;
           return [
-            `${r.date}${up ? " 📈" : " 📉"}`,
-            `均价 <span style="float:right;margin-left:12px">${fmtPrice(r.average)}</span>`,
-            `最高／最低 <span style="float:right;margin-left:12px">${fmtPrice(r.highest)} / ${fmtPrice(r.lowest)}</span>`,
+            r.date,
+            `买一 <span style="float:right;margin-left:12px">${fmtPrice(r.lowest)}</span>`,
+            `卖一 <span style="float:right;margin-left:12px">${fmtPrice(r.highest)}</span>`,
+            `日均 <span style="float:right;margin-left:12px">${fmtPrice(r.average)}</span>`,
             `成交量 <span style="float:right;margin-left:12px">${fmtVol(r.volume)}</span>`,
             `挂单笔数 <span style="float:right;margin-left:12px">${r.order_count.toLocaleString()}</span>`,
           ].join("<br/>");
         },
       },
-      grid: [
-        { left: 56, right: 16, top: 10, height: "58%" },
-        { left: 56, right: 16, top: "74%", height: "14%" },
-      ],
-      xAxis: [
-        { type: "category", data: cats, boundaryGap: true },
-        { type: "category", gridIndex: 1, data: cats, axisLabel: { show: false }, axisTick: { show: false } },
-      ],
-      yAxis: [
-        { scale: true, splitLine: { lineStyle: { opacity: 0.25 } } },
-        { gridIndex: 1, axisLabel: { show: false }, splitLine: { show: false } },
-      ],
-      dataZoom: [
-        { type: "inside", xAxisIndex: [0, 1], start: 0, end: 100 },
-        { type: "slider", xAxisIndex: [0, 1], bottom: 0, height: 16, start: 0, end: 100 },
-      ],
+      grid: { left: 56, right: 16, top: 28, bottom: 28 },
+      xAxis: { type: "category", data: cats },
+      yAxis: { scale: true, splitLine: { lineStyle: { opacity: 0.25 } } },
+      // 不要底部滑块（用户指定）；滚轮缩放留在 inside 里，总览/还原靠切区间按钮。
+      dataZoom: [{ type: "inside", start: 0, end: 100 }],
       series: [
         {
-          type: "candlestick",
-          data: kline,
-          itemStyle: { color: UP, color0: DOWN, borderColor: UP, borderColor0: DOWN },
+          name: "买一",
+          type: "bar",
+          data: bids,
+          itemStyle: { color: UP },
         },
-        { type: "bar", xAxisIndex: 1, yAxisIndex: 1, data: vols, itemStyle: { opacity: 0.45 } },
+        { name: "卖一", type: "bar", data: asks, itemStyle: { color: DOWN } },
       ],
-      // notMerge：区间切换时行集整个换掉，合并模式会把旧 series 的残留 dataZoom 区间留下。
-    }, { notMerge: false });
-  }, [bars, box, loading]);
+      // 切区间行集整个换掉；不合并旧轴配置，避免残留上一个窗口的刻度。
+    }, { notMerge: true });
+  }, [bars, range, box, loading]);
 
   // 窗口/分栏宽度一变，画布不会自己重排；不监听的话图会被拉宽压扁到下次 setOption。
   useEffect(() => {
@@ -156,11 +151,20 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
   return (
     <div className="hist">
       <div className="hist-ttl">
-        {name || `type_id ${typeId}`} · 日线全部历史
+        {name || `type_id ${typeId}`} · 日线
       </div>
       <div className="hist-tabs">
-        {/* 直白计数：起止日期 + 天数，不用 "1Y/已积累" 这类术语。
-            上游窗口实测最多 418 天（附录 A.4）。 */}
+        {/* 区间就三档中文；旧窗口残留问题由 notMerge 全量刷新兜住。 */}
+        {RANGES.map((r) => (
+          <button
+            key={r.key}
+            className={range.key === r.key ? "on" : ""}
+            title={r.label}
+            onClick={() => setRange(r)}
+          >
+            {r.key}
+          </button>
+        ))}
         <span className="cov" title="按该类型自己的天数计，不是所有类型的平均值">
           {first && last
             ? `共 ${bars.length} 天：${first.date} 至 ${last.date}`
@@ -175,12 +179,11 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
           也可用 emd history --type {typeId} 手动补一次。
         </div>
       ) : (
-        // 没有区间按钮后图就是唯一主角，给足高度；左右拖动看局部用下方滑块。
         <div ref={setBox} style={{ width: "100%", height: 420 }} />
       )}
       <div className="note">
-        历史是 (星域, 类型) 维度、无站点维度：图上是 The Forge 的日均价，跨站对比只有当前快照。
-        滚轮或底部滑块可放大拖动看局部。
+        蓝柱 = 当天买一（卖出目标价）、红柱 = 当天卖一（买入成本）。历史是 (星域, 类型)
+        维度、无站点维度，跨站对比只有当前快照。
       </div>
     </div>
   );

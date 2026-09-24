@@ -5,7 +5,7 @@ import HistoryChart from "./HistoryChart";
 import type { PriceLevel } from "../types";
 
 function Ladder({ side, levels }: { side: "ask" | "bid"; levels: PriceLevel[] }) {
-  const max = Math.max(1, ...levels.map((l) => l.volume));
+  // 用户指定：不要图形表达（深度条已去），只留数字；颜色仍标买/卖。
   const color = side === "ask" ? "var(--ask)" : "var(--bid)";
   return (
     <div className={`ladder ${side}`}>
@@ -19,11 +19,8 @@ function Ladder({ side, levels }: { side: "ask" | "bid"; levels: PriceLevel[] })
         const cum = levels.slice(0, i + 1).reduce((a, b) => a + b.volume, 0);
         return (
           <div key={`${l.price}-${i}`} className={`row${i === 0 ? " best" : ""}`}>
-            {/* 深度条塞进价格单元格里做绝对定位背景：表头和数据行同为 4 列，
-                列列对齐。之前 bar 当第 5 个 grid 子元素，"笔"整列掉到第二行。 */}
-            <span className="p">
-              <span className="bar" style={{ width: `${(l.volume / max) * 100}%`, background: color }} />
-              <span style={{ color: side === "ask" ? "var(--ask)" : "var(--bid)" }}>{fmtPrice(l.price)}</span>
+            <span className="p" style={{ color }}>
+              {fmtPrice(l.price)}
             </span>
             <span className="v">{fmtVol(l.volume)}</span>
             <span className="v">{fmtVol(cum)}</span>
@@ -106,7 +103,7 @@ export default function OrderBook() {
             {detail.skipped_wholesale}
           </div>
           <div className="note">
-            卖单栏是你的买入成本、买单栏是卖出目标；深度只画前 5 档，实际吃单会顺着阶梯往上抬价。
+            卖单栏是你的买入成本、买单栏是卖出目标；只列前 5 档，实际吃单会顺着阶梯往上抬价。
           </div>
         </div>
       )}

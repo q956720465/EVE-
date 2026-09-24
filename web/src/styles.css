@@ -265,8 +265,8 @@ button:hover {
 .ladder .row {
   /* grid 挂在行级而不是 `.ladder` 上：否则表头和每个数据行各被当成
      一个 grid item 横向并排，行列整个转置（复验 A 抓到）。
-     四轨等宽：行级 grid 各算各的 auto 列宽，"笔"列会随行内容抖动错位，
-     等宽轨道让四行天生同列。 */
+     四轨等宽：行级 grid 各算各的 auto 列宽会随行内容抖动错位，
+     等宽轨道让四行天生同列。深度条已按用户要求移除，纯数字表格。 */
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0 10px;
@@ -282,28 +282,8 @@ button:hover {
   padding: 2px 0;
 }
 
-/* 深度条是价格格里的绝对定位背景：不再占 grid 位，表头/数据行都是 4 列。 */
-.ladder .p {
-  position: relative;
-}
-
 .ladder {
   font-variant-numeric: tabular-nums;
-}
-
-.ladder .bar {
-  position: absolute;
-  inset: 1px 0;
-  opacity: 0.16;
-  pointer-events: none;
-}
-
-.ladder.ask .bar {
-  background: var(--ask);
-}
-
-.ladder.bid .bar {
-  background: var(--bid);
 }
 
 .ladder .row.best .p {

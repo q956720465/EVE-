@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::stream::{self, StreamExt};
 use tokio::sync::watch;
 
 use crate::error::{Error, Result};
@@ -23,6 +24,37 @@ use crate::store::{Db, HistoryTarget, RoundRecord};
 /// 300 s 缓存下限 + 60 s 余量。低于 300 s 即绕过缓存，代码层面拦住。
 pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
 
+/// T1.5 跨区补拉配置（方案 v3.1 §3.1：隔轮 ≈12 min；默认启用）。
+#[derive(Debug, Clone)]
+pub struct XRegionConfig {
+    pub enabled: bool,
+    pub candidate_top: usize,
+    pub targets: [(u32, u64); 3],
+    pub max_age_secs: i64,
+}
+
+impl Default for XRegionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            candidate_top: 200,
+            targets: market::XREGION_TARGETS,
+            max_age_secs: market::XREGION_MAX_AGE_SECS,
+        }
+    }
+}
+
+impl XRegionConfig {
+    /// 运行期开关：`EMD_XREGION=0` 关闭（默认值刻意不走 env，测试不被环境左右）。
+    pub fn from_env() -> Self {
+        let mut c = Self::default();
+        if let Ok(v) = std::env::var("EMD_XREGION") {
+            c.enabled = v != "0";
+        }
+        c
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     pub region_id: u32,
@@ -34,6 +66,8 @@ pub struct SchedulerConfig {
     pub rounds: Option<u64>,
     /// T3 历史档（§3.1 的每日 11:20 UTC / §3.3 的 L0+L1）。
     pub history: HistoryConfig,
+    /// T1.5 跨区补拉（§3.1 隔轮 / §4.1 三枢纽）。
+    pub xregion: XRegionConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -46,6 +80,7 @@ impl Default for SchedulerConfig {
             rounds: None,
             // 默认值刻意不走 `from_env`：环境变量是运行期配置，测试不能被它左右。
             history: HistoryConfig::default(),
+            xregion: XRegionConfig::default(),
         }
     }
 }
@@ -206,6 +241,43 @@ impl Scheduler {
             let round_start = Instant::now();
             let outcome = self.run_round(round).await;
 
+            // T1.5：隔轮、错峰窗口外、且本轮快照可用时才跑；失败只告警不打断主循环
+            // （跨区数据缺一批 = 少一些候选，不是错误）。
+            if self.cfg.xregion.enabled
+                && t1_5_due(round)
+                && outcome.is_ok()
+                && !xregion_blackout(chrono::Utc::now())
+            {
+                match self.run_t1_5().await {
+                    Ok(Some(rep)) => tracing::info!(
+                        "T1.5 完成：{} 本跨区单簿",
+                        rep.books_written
+                    ),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("T1.5 未完成：{e}"),
+                }
+            }
+            // 生命周期：每轮结算（缺席以轮为尺，v3.1「连续 2 轮」）；轮失败不结算——
+            // 数据不可用 ≠ 机会消失，拿旧盘口重新记账会伪造「仍在命中」。
+            if outcome.is_ok() {
+                match market::lifecycle::update_round(
+                    &self.db,
+                    chrono::Utc::now().timestamp(),
+                ) {
+                    Ok(Some(s)) => tracing::info!(
+                        "机会生命周期：活跃 {}｜新 {}｜复活 {}｜失效 {}｜过期 {}（写 {}）",
+                        s.active,
+                        s.new,
+                        s.revived,
+                        s.invalidated,
+                        s.expired,
+                        s.saved
+                    ),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("机会生命周期结算失败：{e}"),
+                }
+            }
+
             // T3 历史增量。放在 T1 之后、算下一次时刻之前是有意的两点：
             // ① 流动池排名要用刚落地的那一轮快照；② 万一这一趟跑了几分钟，
             // `plan_next` 取的是 `max(轮开始+interval, Expires)`，晚于两个锚点，
@@ -308,6 +380,119 @@ impl Scheduler {
         history::backfill(&self.client, &self.db, h, &targets).await
     }
 
+    /// 跑一趟 T1.5：上一轮命中的 Top N 候选 × 三枢纽定向补拉 → 聚合 → 落 xregion_books。
+    /// `Ok(None)` = 无候选（0 机会的快照，或没跑过采集）——不是错误。
+    pub async fn run_t1_5(&self) -> Result<Option<XRegionReport>> {
+        let books = self.db.load_books()?;
+        let hubs = self.db.flip_hubs()?;
+        let vol = self.db.latest_vol24()?;
+        let params = self.db.get_flip_params()?;
+        let out = market::scan(&books, &hubs, &params, &vol);
+        let cand = candidates_from(&out.opportunities, self.cfg.xregion.candidate_top);
+        if cand.is_empty() {
+            return Ok(None);
+        }
+
+        let started_at = chrono::Utc::now().timestamp();
+        let t0 = Instant::now();
+        // 全笛卡尔积并发（约 600 请求，实测墙钟 136–226 s @并发 16）。
+        let jobs: Vec<(u32, u64, u32)> = self
+            .cfg
+            .xregion
+            .targets
+            .iter()
+            .flat_map(|&(r, h)| cand.iter().map(move |&t| (r, h, t)))
+            .collect();
+        let results: Vec<(u32, u64, u32, Result<market::TypeFetch>)> =
+            stream::iter(jobs)
+                .map(|(r, h, t)| async move {
+                    (
+                        r,
+                        h,
+                        t,
+                        market::fetch_type_orders(&self.client, r, t).await,
+                    )
+                })
+                .buffer_unordered(self.client.config().concurrency)
+                .collect()
+                .await;
+
+        let mut rep = XRegionReport {
+            types_requested: cand.len(),
+            ..Default::default()
+        };
+        for &(region, hub) in &self.cfg.xregion.targets {
+            let mut fetched: Vec<u32> = Vec::new();
+            let mut hub_books: Vec<market::StationOrderBook> = Vec::new();
+            for (r, h, t, res) in &results {
+                if *r != region || *h != hub {
+                    continue;
+                }
+                match res {
+                    Ok(f) => {
+                        rep.types_ok += 1;
+                        rep.requests += f.pages;
+                        rep.orders += f.orders.len() as u64;
+                        fetched.push(*t);
+                        hub_books.extend(
+                            market::aggregate(&f.orders, &market::aggregate_opts())
+                                .into_iter()
+                                .filter(|b| b.location_id == hub),
+                        );
+                    }
+                    Err(e) => {
+                        rep.types_failed += 1;
+                        tracing::debug!("T1.5 {region}/{t} 失败：{e}");
+                    }
+                }
+            }
+            if fetched.is_empty() {
+                continue;
+            }
+            rep.books_written += self
+                .db
+                .write_xregion_books(hub, region, &fetched, &hub_books)?;
+            self.db.remember_station(hub, true)?;
+            // 配错枢纽 ID 的显式兜底：整站零本就必须喊出来，别让 T1.5 静默空转。
+            if hub_books.is_empty() {
+                tracing::error!(
+                    "T1.5 枢纽 {hub}（region {region}）本批 0 本单簿——疑似站 ID 与真实枢纽不符"
+                );
+            }
+        }
+        let pruned = self
+            .db
+            .prune_xregion(started_at - market::XREGION_PRUNE_SECS)?;
+        rep.seconds = t0.elapsed().as_secs_f64();
+        self.db.record_xregion_log(&crate::store::XRegionLog {
+            started_at,
+            types: rep.types_requested as i64,
+            regions: self.cfg.xregion.targets.len() as i64,
+            requests: rep.requests as i64,
+            orders: rep.orders as i64,
+            books_written: rep.books_written as i64,
+            failed: rep.types_failed as i64,
+            seconds: rep.seconds,
+            status: if rep.types_failed == 0 {
+                "ok".into()
+            } else {
+                format!("partial: {} 类型失败", rep.types_failed)
+            },
+        })?;
+        tracing::info!(
+            "T1.5：候选 {} 类型 × {} 枢纽 → {} 页 / {} 单 / {} 本跨区单簿（失败 {}，剪除旧行 {}），耗时 {:.1}s",
+            rep.types_requested,
+            self.cfg.xregion.targets.len(),
+            rep.requests,
+            rep.orders,
+            rep.books_written,
+            rep.types_failed,
+            pruned,
+            rep.seconds
+        );
+        Ok(Some(rep))
+    }
+
     fn consecutive_failures(&self) -> Result<usize> {
         let mut stmt = self.db.conn().prepare(
             "SELECT status FROM round_log ORDER BY id DESC LIMIT 10",
@@ -403,6 +588,40 @@ pub fn consecutive_failures(statuses: &[String]) -> usize {
         .count()
 }
 
+/// 隔轮执行：轮号偶数（T1 6 min 节拍下 ≈ 每 12 分钟）。
+pub fn t1_5_due(round: u64) -> bool {
+    round % 2 == 0
+}
+
+/// 错峰：11:10–11:35 UTC 暂停 T1.5（v3.1 §3.1，给 T2 独占窗口留位）。
+pub fn xregion_blackout(t: chrono::DateTime<chrono::Utc>) -> bool {
+    use chrono::Timelike;
+    let m = t.hour() * 60 + t.minute();
+    (11 * 60 + 10..=11 * 60 + 35).contains(&m)
+}
+
+/// 候选类型 = 扫描结果按既有排序取前 N 个去重 type_id（保持分数序，天然截断）。
+pub fn candidates_from(opps: &[market::Opportunity], top: usize) -> Vec<u32> {
+    let mut seen = std::collections::HashSet::new();
+    opps.iter()
+        .filter(|o| seen.insert(o.type_id))
+        .map(|o| o.type_id)
+        .take(top)
+        .collect()
+}
+
+/// T1.5 一趟的结果（日志 + daemon xregion 展示）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XRegionReport {
+    pub types_requested: usize,
+    pub types_ok: usize,
+    pub types_failed: usize,
+    pub requests: u32,
+    pub orders: u64,
+    pub books_written: usize,
+    pub seconds: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +691,10 @@ mod tests {
         // T3 挂在同一个配置上，默认按 §3.3 的 L0=1 200 / L1=300。
         assert_eq!((c.history.l0_cap, c.history.l1_daily), (1_200, 300));
         assert_eq!(c.history.region_id, market::REGION_FORGE);
+        // T1.5 挂在同一处：默认启用、Top200、三枢纽（方案 v3.1 §4.1）。
+        assert!(c.xregion.enabled);
+        assert_eq!(c.xregion.candidate_top, 200);
+        assert_eq!(c.xregion.targets, market::XREGION_TARGETS);
     }
 
     #[tokio::test]
@@ -600,5 +823,57 @@ mod tests {
         assert_eq!(last.status, "failed: x");
         assert_eq!(last.orders, 408_002);
         assert_eq!(last.pages, 409);
+    }
+
+    // ---- M4b：T1.5 跨区补拉的纯函数与配置 ---------------------------------
+
+    #[test]
+    fn t1_5_runs_on_even_rounds_only() {
+        assert!(!t1_5_due(1));
+        assert!(t1_5_due(2));
+        assert!(!t1_5_due(3));
+        assert!(t1_5_due(4));
+    }
+
+    #[test]
+    fn blackout_window_is_11_10_to_11_35_utc() {
+        use chrono::TimeZone;
+        let at = |h, m| chrono::Utc.with_ymd_and_hms(2026, 9, 24, h, m, 0).unwrap();
+        assert!(!xregion_blackout(at(11, 9)));
+        assert!(xregion_blackout(at(11, 10)));
+        assert!(xregion_blackout(at(11, 35)));
+        assert!(!xregion_blackout(at(11, 36)));
+        assert!(!xregion_blackout(at(3, 20)));
+    }
+
+    #[test]
+    fn candidates_dedupe_types_keep_score_order() {
+        let o = |t: u32| market::Opportunity {
+            type_id: t,
+            buy_loc: 1,
+            sell_loc: 2,
+            buy_price: 1.0,
+            sell_price: 2.0,
+            qty: 1,
+            net_per_unit: 1.0,
+            net_total: 1.0,
+            margin_pct: 1.0,
+            vol24: 1,
+            vol_source: market::VolSource::Depth,
+            buy_levels: 1,
+            sell_levels: 1,
+        };
+        let list = vec![o(34), o(34), o(35), o(36), o(35)];
+        assert_eq!(candidates_from(&list, 2), vec![34, 35]);
+        assert_eq!(candidates_from(&list, 10), vec![34, 35, 36]);
+    }
+
+    #[test]
+    fn xregion_defaults_match_the_plan() {
+        let c = XRegionConfig::default();
+        assert!(c.enabled, "方案 v3.1 口径：默认启用，EMD_XREGION=0 关闭");
+        assert_eq!(c.candidate_top, 200);
+        assert_eq!(c.targets, market::XREGION_TARGETS);
+        assert_eq!(c.max_age_secs, market::XREGION_MAX_AGE_SECS);
     }
 }

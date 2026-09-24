@@ -1,3 +1,4 @@
+mod alert_db;
 mod char_db;
 mod db;
 mod schema;

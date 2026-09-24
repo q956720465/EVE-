@@ -45,6 +45,16 @@ use crate::char::JournalEntry;
 use crate::market::{FeeModel, Side, StationOrderBook};
 use crate::store::{CharOrder, WalletTx};
 
+mod state;
+
+/// 告警状态机与闸门（spec §4.4）：边沿触发 / 深化穿透 / 日限按条目 / 跨周期保通知史。
+/// 判定（本文件上半）与状态机（[`state`]）分开：判定只管"这一轮亏没亏"，
+/// 状态机管"该不该推、推过几次"。
+pub use state::{
+    can_push, day_entries_used, mark_pushed, tick_alert, AlertRecord, AlertState,
+    ALERT_COOLDOWN_SECS, ALERT_DAILY_CAP, ALERT_DEEPEN_PP,
+};
+
 /// alert_key 的两个前缀：规范文本形态只在这里定义，T9 的读写两侧都复用这两个常量。
 const KEY_ORDER: &str = "order";
 const KEY_TX: &str = "tx";

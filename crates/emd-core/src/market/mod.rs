@@ -16,7 +16,9 @@ pub use history::{
     ESI_WINDOW_DAYS, L0_DAILY_CAP, L1_DAILY_CAP, TIER_L0, TIER_L1,
 };
 pub use hubs::{hub_pool, Hub, DEFAULT_MIN_ORDERS, DEFAULT_TOP};
-pub use orderbook::{fetch_region_orders, RoundOutcome};
+pub use orderbook::{
+    capped_pages, fetch_region_orders, fetch_type_orders, type_page_path, RoundOutcome, TypeFetch,
+};
 
 /// The Forge —— 吉他所在星域。
 pub const REGION_FORGE: u32 = 10000002;
@@ -41,3 +43,11 @@ pub const HUB_REGIONS: [(&str, u32); 4] = [
 pub const XREGION_MAX_AGE_SECS: i64 = 45 * 60;
 /// 跨区旧行剪除线（表有界的最后一道保险）。
 pub const XREGION_PRUNE_SECS: i64 = 24 * 3600;
+
+/// T1.5 三个目标枢纽（方案 v3.1 §4.1；星域即 HUB_REGIONS 后三项）。
+/// 枢纽站 ID 为公开稳定值；真机验收以"三站各 >0 本"校验 ID 未手滑。
+pub const XREGION_TARGETS: [(u32, u64); 3] = [
+    (10000043, 60008494), // Domain — Amarr VIII (Oris) - Emperor Family Academy
+    (10000042, 60005686), // Metropolis — Hek VIII - Moon 12 - Boundless Creation Factory
+    (10000030, 60004588), // Heimatar — Rens VI - Moon 8 - Brutor Tribe Treasury
+];

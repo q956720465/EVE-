@@ -17,6 +17,10 @@ use crate::market::entities::{Order, OrdersResponse};
 const MAX_FAILED_RATIO: f64 = 0.01;
 const ROUND_RETRIES: u32 = 2;
 
+/// T1.5 定向拉取的页数上限（防呆）：实测单类型单星域 ≈1 页（148 条），
+/// 5 页 = 5000 条是几乎不可能的尾部；超过就截断并把 truncated 计进台账。
+const TYPE_PAGE_CAP: u32 = 5;
+
 #[derive(Debug, Clone)]
 pub struct RoundOutcome {
     pub region_id: u32,
@@ -50,6 +54,57 @@ impl RoundOutcome {
 
 fn page_path(region_id: u32, page: u32) -> String {
     format!("/v3/markets/{region_id}/orders?order_type=all&page={page}")
+}
+
+/// T1.5 定向拉取的路径模板：`type_id` 过滤让单请求返回 1 页 ≈148 条。
+pub fn type_page_path(region_id: u32, type_id: u32, page: u32) -> String {
+    format!("/v3/markets/{region_id}/orders?type_id={type_id}&order_type=all&page={page}")
+}
+
+pub fn capped_pages(x_pages: u32) -> u32 {
+    x_pages.clamp(1, TYPE_PAGE_CAP)
+}
+
+/// 单 (region, type) 一次定向拉取的结果。
+#[derive(Debug, Clone)]
+pub struct TypeFetch {
+    pub region_id: u32,
+    pub type_id: u32,
+    pub orders: Vec<Order>,
+    pub pages: u32,
+    pub truncated: bool,
+}
+
+/// 拉取单个 (region, type) 的全部页（通常 1 页）。任一页失败即整型失败——
+/// 缺页的半本盘口会低估深度，宁可让该类型本轮不参与配对（下批自然重试）。
+pub async fn fetch_type_orders(
+    client: &EsiClient,
+    region_id: u32,
+    type_id: u32,
+) -> Result<TypeFetch> {
+    let first = client
+        .fetch(&type_page_path(region_id, type_id, 1))
+        .await?;
+    let x_pages = resolve_pages(&first)?;
+    let snapshot_lm = first.meta().last_modified.clone();
+    let pages = capped_pages(x_pages);
+    let mut acc = decode(client, first)?.orders;
+    for page in 2..=pages {
+        let f = client
+            .fetch(&type_page_path(region_id, type_id, page))
+            .await?;
+        let d = decode(client, f)?;
+        // 与全量拉取同一条纪律：跨页 Last-Modified 不一致 = 快照不自洽。
+        check_drift(page, &d, snapshot_lm.as_deref())?;
+        acc.extend(d.orders);
+    }
+    Ok(TypeFetch {
+        region_id,
+        type_id,
+        orders: acc,
+        pages,
+        truncated: x_pages > TYPE_PAGE_CAP,
+    })
 }
 
 /// 拉取一个星域的全量订单簿。
@@ -304,5 +359,26 @@ mod tests {
             let j = jitter(base, p);
             assert!(j >= base && j <= base + Duration::from_millis(60));
         }
+    }
+
+    // ---- M4b：T1.5 单类型定向拉取 -----------------------------------------
+
+    #[test]
+    fn type_page_path_shape() {
+        assert_eq!(
+            type_page_path(10000043, 34, 2),
+            "/v3/markets/10000043/orders?type_id=34&order_type=all&page=2"
+        );
+    }
+
+    #[test]
+    fn page_cap_is_five() {
+        assert_eq!(capped_pages(1), 1);
+        assert_eq!(capped_pages(3), 3);
+        assert_eq!(
+            capped_pages(40),
+            TYPE_PAGE_CAP,
+            "单类型单星域 >5 页截断并记 truncated"
+        );
     }
 }

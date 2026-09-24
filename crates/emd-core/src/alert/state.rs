@@ -29,7 +29,8 @@
 
 use crate::alert::{AlertKind, AlertPayload};
 
-/// 同一 key 每自然日至多几条（硬闸，穿透不豁免）。
+/// **全局**硬闸，穿透不豁免：全部条目**当日合计**至多几条。单条目签名的 [`can_push`] 看不到
+/// 集合，装配层必须补 [`day_entries_used`]（两半合体一次判完 = `can_push_in`）。
 pub const ALERT_DAILY_CAP: u32 = 5;
 /// 同一 key 的通知冷却（spec 未给数，照 M4b 的 4h）。
 pub const ALERT_COOLDOWN_SECS: i64 = 4 * 3600;
@@ -217,7 +218,25 @@ pub fn can_push(rec: &AlertRecord, now: i64, today: &str) -> bool {
     cooldown_passed || deepened
 }
 
+/// 当日推送闸门（**装配层首选入口**）：逐条目那一半 + 当日全局封口，一次判完。
+///
+/// [`can_push`] 单独用**不够** —— 它看不到集合：别的条目把当日的 [`ALERT_DAILY_CAP`] 条额度
+/// 吃光时，一个自己从没推过的条目照样会被它放行（"撤单重挂"就是从这里绕开日限的）。语义就是
+/// 过去写在注释里、要装配层自己拼的那行表达式，收到一处以免只接一半线：
+///     `can_push(rec, now, today) && day_entries_used(&all, today) < ALERT_DAILY_CAP`
+///
+/// `recs` 的范围与 [`day_entries_used`] 同要求：**整个 `alerts` 集合**，含本轮没命中的、
+/// `Cleared` 的、以及 `rec` 自己（它今天推过的条数本来就该计入全局用量），不是本轮命中
+/// 那几条 —— 喂错就把全局闸降级成"每轮"闸，没有报错，也没有卡片差异。
+pub fn can_push_in(recs: &[AlertRecord], rec: &AlertRecord, now: i64, today: &str) -> bool {
+    can_push(rec, now, today) && day_entries_used(recs, today) < ALERT_DAILY_CAP
+}
+
 /// 推送成功后记账（装配层调用；自然日滚动重置计数）。
+///
+/// 过闸用的是当日额度的**全局**判据（`can_push_in`，或 [`can_push`] 补一条
+/// [`day_entries_used`]）—— 计数只在这里推进，而它正是全局用量的加数：漏调一次，这一条
+/// 在当日账上就没占额度，5 条硬闸被静默绕过（[`ALERT_DAILY_CAP`] 是全局闸，不是本条目闸）。
 pub fn mark_pushed(rec: &mut AlertRecord, now: i64, today: &str) {
     rec.state = AlertState::Notified;
     rec.notified_at = Some(now);
@@ -236,6 +255,11 @@ pub fn mark_pushed(rec: &mut AlertRecord, now: i64, today: &str) {
 ///
 /// 计量单位是条目而不是卡片（spec §4.4）—— 一张合并卡片里有 N 条，当日用量就 +N，
 /// 所以这里求和而不是数卡片。跨天自然归零（`notified_day` 与 `today` 不同就不计入）。
+///
+/// **`recs` 的范围是"整个 `alerts` 集合"**：库里全部告警行，包含本轮没命中的、以及 `Cleared`
+/// 的（它们今天推掉的条数同样占额度）。只喂"本轮命中"那几条，全局日限就退化成"每轮 ≤5 条"，
+/// 且不报错 —— 少算的正是今天早些轮次推掉、本轮没再命中的那部分用量（函数看不出喂进来的是
+/// 全量还是切片）。
 pub fn day_entries_used(recs: &[AlertRecord], today: &str) -> u32 {
     recs.iter()
         .filter(|r| r.notified_day.as_deref() == Some(today))
@@ -381,6 +405,42 @@ mod tests {
         mark_pushed(&mut card[0], T0 + 86_400, DAY2);
         assert_eq!(day_entries_used(&card, DAY2), 1, "次日只算新推的那一条");
         assert_eq!(card[0].notified_count_day, 1, "跨天重新从 1 起算");
+    }
+
+    #[test]
+    fn can_push_in_closes_the_global_cap_bare_can_push_cannot() {
+        // 合体入口（装配层首选）：单条目闸门放行的第 6 条，在当日全局额度已满时必须被拒。
+        // 上面 daily_cap_counts_order_entries_not_cards 断言的是"单条目闸门返回 true"（负对
+        // 照/漏配的那一半）；这条断言合体后必须返回 false —— 两者相反才是全局硬闸还活着。
+        let mut card: Vec<AlertRecord> = (7001..=7005).map(|id| fresh(order_alert_key(id), -3.0)).collect();
+        for r in card.iter_mut() {
+            mark_pushed(r, T0, DAY);
+        }
+        assert_eq!(day_entries_used(&card, DAY), ALERT_DAILY_CAP);
+
+        let sixth = fresh(order_alert_key(7006), -3.0);
+        assert!(can_push(&sixth, T0, DAY), "单条目闸门看不到集合 → 第 6 条被放行");
+        assert!(
+            !can_push_in(&card, &sixth, T0, DAY),
+            "合体后必须拒绝：当日 5 条已满（只接 can_push 那一半就会漏掉这一条）"
+        );
+
+        // 反面：额度还有余量时必须放行，否则这函数只是"一律拒绝"，上面的拒绝说明不了是全局闸咬的。
+        assert!(can_push_in(&[], &sixth, T0, DAY), "当日额度没用过 → 合体放行");
+        // 跨天归零后同一条又能推（全局闸按自然日滚动，不是永久封口）。
+        assert!(
+            can_push_in(&card, &sixth, T0 + 86_400, DAY2),
+            "次日额度归零 → 合体放行"
+        );
+        // 已清的条目也占着今天的额度（`Cleared` 不退回已推条数）。
+        let mut spent: Vec<AlertRecord> = card[..4].to_vec();
+        spent.push(tick_alert(Some(&card[4]), false, T0 + 60).expect("有基线行就有迁移"));
+        assert_eq!(spent[4].state, AlertState::Cleared);
+        assert_eq!(day_entries_used(&spent, DAY), ALERT_DAILY_CAP, "清态条目仍计入当日用量");
+        assert!(
+            !can_push_in(&spent, &sixth, T0 + 120, DAY),
+            "全局用量看的是今天推过的条数，与这些条目现在的状态无关"
+        );
     }
 
     #[test]

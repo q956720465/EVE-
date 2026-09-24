@@ -12,7 +12,7 @@ use emd_core::config::EsiConfig;
 use emd_core::esi::EsiClient;
 use emd_core::market::history::{self, HistoryConfig};
 use emd_core::market::{self, STATION_JITA};
-use emd_core::scheduler::{Scheduler, SchedulerConfig, Stage};
+use emd_core::scheduler::{Scheduler, SchedulerConfig, Stage, XRegionConfig};
 use emd_core::store::{now_unix, Db, PriceRow};
 use emd_core::tree;
 
@@ -32,6 +32,8 @@ enum Command {
     List,
     History,
     Flip,
+    XRegion,
+    Opps,
 }
 
 #[derive(Debug)]
@@ -52,6 +54,10 @@ struct Args {
     /// flip 专用：临时覆盖技能等级做口径对比（不持久化）。
     accounting: Option<u8>,
     broker_relations: Option<u8>,
+    /// opps 专用：--update 打开每轮生命周期结算后再展示。
+    do_update: bool,
+    /// opps 专用：按状态过滤（new/notified/expired/invalidated）。
+    state: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -76,6 +82,8 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
     let mut do_probe = false;
     let mut accounting: Option<u8> = None;
     let mut broker_relations: Option<u8> = None;
+    let mut do_update = false;
+    let mut state: Option<String> = None;
 
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -93,6 +101,8 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
             "list" => cmd = Some(Command::List),
             "history" => cmd = Some(Command::History),
             "flip" => cmd = Some(Command::Flip),
+            "xregion" => cmd = Some(Command::XRegion),
+            "opps" => cmd = Some(Command::Opps),
             "--db" => db = PathBuf::from(it.next().context("--db 缺参数")?),
             "--word" => word = it.next().context("--word 缺参数")?,
             "--type" => {
@@ -149,12 +159,20 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
                         .context("--broker-relations 需要 0-5 的数字")?,
                 )
             }
+            "--update" => do_update = true,
+            "--state" => {
+                let v = it.next().context("--state 缺参数")?;
+                // 未知状态当场拒绝，不静默全表——否则用户以为过滤生效其实没有。
+                emd_core::market::lifecycle::OppState::parse(&v)
+                    .with_context(|| format!("--state 需要 new/notified/expired/invalidated，收到 {v}"))?;
+                state = Some(v);
+            }
             other => anyhow::bail!("未知参数：{other}"),
         }
     }
 
     Ok(Args {
-        command: cmd.context("缺少子命令（round|serve|prices|verify|probe|stats|hubs|jita|names|tree|search|list|history|flip）")?,
+        command: cmd.context("缺少子命令（round|serve|prices|verify|probe|stats|hubs|jita|names|tree|search|list|history|flip|xregion|opps）")?,
         db,
         region,
         ua,
@@ -167,6 +185,8 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
         do_probe,
         accounting,
         broker_relations,
+        do_update,
+        state,
     })
 }
 
@@ -188,6 +208,8 @@ fn print_usage() {
   hubs     打印当前枢纽池（含站点名）
   jita     打印吉他单站单簿前 --limit 行
   flip     倒卖扫描（读本地快照）：Top N 机会 + 丢弃原因分布；费率与技能取面板参数
+  xregion  手工触发一趟 T1.5 跨区补拉（三枢纽 × Top 候选；serve 里隔轮自动跑）
+  opps     打印机会生命周期表；--update 先跑一轮结算再展示；--state 过滤
   names    解析库里未命名的 NPC 站（POST /v1/universe/names）
   tree     一次性建分类树（约 1 000 次请求，实测 1-2 分钟）
   search   按名称搜类型（--word，走 POST /v1/universe/ids，只取 inventory_types）
@@ -199,6 +221,8 @@ fn print_usage() {
   --top N      --limit 的别名（flip 的 Top N，缺省 20）
   --accounting N        flip 临时覆盖 Accounting 等级（0-5，仅本次运行，不写库）
   --broker-relations N  flip 临时覆盖 Broker Relations 等级（0-5，仅本次运行，不写库）
+  --update     opps 展示前先跑一轮 update_round（把当前快照结算进 opportunities）
+  --state S    opps 按状态过滤：new | notified | expired | invalidated
   --type N     history 只取这一个类型
   --dry        history 只打印取数计划与成本估算，不发请求
   --probe      history 的交叉实验：证明 history 不占 market-order 令牌组
@@ -248,6 +272,8 @@ async fn main() -> Result<()> {
         Command::Stats => run_stats(&client, &db, &db_path)?,
         Command::Hubs => run_hubs(&db)?,
         Command::Flip => run_flip(&db, args.limit.unwrap_or(20), args.accounting, args.broker_relations)?,
+        Command::XRegion => run_xregion(&client, &db).await?,
+        Command::Opps => run_opps(&db, args.do_update, args.state.as_deref())?,
         Command::Jita => run_jita(&db, args.limit.unwrap_or(20))?,
         Command::Names => {
             let n = catalog::resolve_missing(&client, &db, args.limit.unwrap_or(400)).await?;
@@ -744,7 +770,8 @@ fn run_hubs(db: &Db) -> Result<()> {
 /// 0 机会时输出丢弃原因分布——没它用户会把正常过滤当成 bug。
 fn run_flip(db: &Db, top: u32, acct: Option<u8>, br: Option<u8>) -> Result<()> {
     let books = db.load_books()?;
-    let hubs = db.hub_pool()?;
+    let hubs = db.flip_hubs()?;
+    let ages = db.xregion_ages()?;
     let vol = db.latest_vol24()?;
     let mut params = db.get_flip_params()?;
     // 临时覆盖只作用于本次运行：同一个快照上对比技能口径，不写库。
@@ -783,15 +810,27 @@ fn run_flip(db: &Db, top: u32, acct: Option<u8>, br: Option<u8>) -> Result<()> {
         "{:<30} {:<34} {:>12} {:>12} {:>8} {:>9} {:>14} {:>9}",
         "类型", "买站→卖站", "买价", "卖价", "可成交", "净利率%", "总净利", "24h量"
     );
+    let now = now_unix();
     for o in out.opportunities.iter().take(top as usize) {
         let tname = db.type_name(o.type_id)?.unwrap_or_else(|| o.type_id.to_string());
         let an = db.station_name(o.buy_loc)?.unwrap_or_else(|| o.buy_loc.to_string());
         let bn = db.station_name(o.sell_loc)?.unwrap_or_else(|| o.sell_loc.to_string());
         let vsrc = if o.vol_source == market::VolSource::History { " " } else { "*" };
+        // 任一站在 xregion_ages 里 = 跨区行；两站取"最老"那份数据的时间戳算年龄。
+        let xregion_badge: String = [o.buy_loc, o.sell_loc]
+            .iter()
+            .filter_map(|l| ages.get(l).copied())
+            .min()
+            .map(|ts| {
+                let secs = (now - ts).max(0);
+                let mins = ((secs + 30) / 60).max(1);
+                format!(" [跨区{mins}m]")
+            })
+            .unwrap_or_default();
         println!(
             "{:<30} {:<34} {:>12} {:>12} {:>8} {:>8.2}% {:>14} {:>8}{}",
-            ellipsis(&tname, 30),
-            ellipsis(&format!("{an}→{bn}"), 34),
+            tname,
+            ellipsis(&format!("{an}→{bn}{xregion_badge}"), 34),
             fmt_price(o.buy_price),
             fmt_price(o.sell_price),
             o.qty,
@@ -801,7 +840,108 @@ fn run_flip(db: &Db, top: u32, acct: Option<u8>, br: Option<u8>) -> Result<()> {
             vsrc,
         );
     }
-    println!("注：24h 量带 * = 该类型无 history 覆盖，用可执行深度估算；费率为估算口径。");
+    println!(
+        "注：24h 量带 * = 该类型无 history 覆盖，用可执行深度估算；带 [跨区Xm] 行的目标站数据来自上一批 T1.5 采集（最长滞后 12 分钟）；费率为估算口径。"
+    );
+    Ok(())
+}
+
+/// 手工触发一趟 T1.5（serve 里隔轮自动跑，这里给验收一个入口）。
+async fn run_xregion(client: &Arc<EsiClient>, db: &Arc<Db>) -> Result<()> {
+    let sched = Scheduler::new(
+        client.clone(),
+        db.clone(),
+        SchedulerConfig {
+            xregion: XRegionConfig::from_env(),
+            ..Default::default()
+        },
+    );
+    match sched.run_t1_5().await? {
+        Some(rep) => {
+            println!(
+                "T1.5：候选 {} 类型 → 成功 {} / 失败 {}｜{} 页 / {} 单 / {} 本跨区单簿｜耗时 {:.1}s",
+                rep.types_requested,
+                rep.types_ok,
+                rep.types_failed,
+                rep.requests,
+                rep.orders,
+                rep.books_written,
+                rep.seconds
+            );
+            if let Some(log) = db.last_xregion_log()? {
+                println!(
+                    "  最近台账：状态 {}｜{} 站｜{} 类型｜{} 请求｜{} 失败",
+                    log.status, log.regions, log.types, log.requests, log.failed
+                );
+            }
+            if rep.books_written == 0 {
+                println!("  提示：三站 0 本单簿 = 站 ID 与真实枢纽不符，请核对 XREGION_TARGETS");
+            }
+        }
+        None => println!("T1.5 未跑：候选空——先跑 round 攒出机会再补拉"),
+    }
+    Ok(())
+}
+
+/// 打印机会生命周期表。可选先结算（--update），可选按状态过滤（--state）。
+fn run_opps(db: &Db, do_update: bool, state: Option<&str>) -> Result<()> {
+    use emd_core::market::lifecycle::{self, OppState};
+    if do_update {
+        match lifecycle::update_round(db, now_unix())? {
+            Some(s) => println!(
+                "本轮结算：活跃 {}｜新 {}｜复活 {}｜失效 {}｜过期 {}（写 {}）",
+                s.active, s.new, s.revived, s.invalidated, s.expired, s.saved
+            ),
+            None => println!("本轮结算跳过（本地还没有快照）"),
+        }
+    }
+    let filter: Option<OppState> = match state {
+        Some(s) => Some(
+            OppState::parse(s)
+                .with_context(|| format!("--state 未知值 {s}"))?,
+        ),
+        None => None,
+    };
+    let rows = db.load_opps()?;
+    let shown: Vec<_> = rows
+        .iter()
+        .filter(|r| filter.map_or(true, |f| r.state == f))
+        .collect();
+    if shown.is_empty() {
+        println!("机会表为空——先跑 serve 或 opps --update");
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:<36} {:<12} {:>8} {:>6} {:>12} {:>12} {}",
+        "类型", "买站→卖站", "状态", "净利率%", "缺席", "首次 seen", "最近 seen", "通知(day×count@at)"
+    );
+    for r in shown.iter() {
+        let tname = db.type_name(r.type_id)?.unwrap_or_else(|| r.type_id.to_string());
+        let an = db.station_name(r.buy_loc)?.unwrap_or_else(|| r.buy_loc.to_string());
+        let bn = db.station_name(r.sell_loc)?.unwrap_or_else(|| r.sell_loc.to_string());
+        let notify = match (r.notified_at, r.notified_day.as_deref()) {
+            (Some(at), Some(day)) => format!("{day}x{}@{at}", r.notified_count_day),
+            (Some(at), None) => format!("@{at}"),
+            _ => "-".into(),
+        };
+        println!(
+            "{:<12} {:<36} {:<12} {:>8.2} {:>6} {:>12} {:>12} {}",
+            ellipsis(&tname, 12),
+            ellipsis(&format!("{an}→{bn}"), 36),
+            r.state.as_str(),
+            r.last_margin_pct,
+            r.miss_streak,
+            r.first_seen_at,
+            r.last_seen_at,
+            notify,
+        );
+    }
+    let mut counts: std::collections::BTreeMap<&'static str, u32> = Default::default();
+    for r in rows.iter() {
+        *counts.entry(r.state.as_str()).or_insert(0) += 1;
+    }
+    let summary: Vec<String> = counts.into_iter().map(|(s, c)| format!("{s} {c}")).collect();
+    println!("显示 {} 行｜全表按状态：{}", shown.len(), summary.join("｜"));
     Ok(())
 }
 
@@ -889,7 +1029,7 @@ mod tests {
         // 保证 help 里列的每个子命令都能被解析到，不会写出说明里没有（或说明里有但没实现）的命令。
         let words = [
             "round", "serve", "prices", "verify", "probe", "stats", "hubs", "jita", "names",
-            "tree", "search", "list", "history", "flip",
+            "tree", "search", "list", "history", "flip", "xregion", "opps",
         ];
         let want = [
             Command::Round,
@@ -906,6 +1046,8 @@ mod tests {
             Command::List,
             Command::History,
             Command::Flip,
+            Command::XRegion,
+            Command::Opps,
         ];
         for (w, x) in words.iter().zip(want.iter()) {
             let a = parse_from([w.to_string()].into_iter()).unwrap_or_else(|e| panic!("{w}: {e}"));
@@ -945,5 +1087,20 @@ mod tests {
         .unwrap();
         assert_eq!((c.accounting, c.broker_relations), (Some(5), Some(3)));
         assert!(parse_from(["flip", "--accounting", "x"].into_iter().map(String::from)).is_err());
+    }
+
+    #[test]
+    fn parses_xregion_and_opps() {
+        let a = parse_from(["xregion"].into_iter().map(String::from)).unwrap();
+        assert_eq!(a.command, Command::XRegion);
+        let b = parse_from(["opps", "--update"].into_iter().map(String::from)).unwrap();
+        assert_eq!(b.command, Command::Opps);
+        assert!(b.do_update, "--update 打开生命周期结算");
+        let c = parse_from(["opps", "--state", "expired"].into_iter().map(String::from)).unwrap();
+        assert_eq!(c.state.as_deref(), Some("expired"));
+        assert!(
+            parse_from(["opps", "--state", "nonsense"].into_iter().map(String::from)).is_err(),
+            "未知状态当场拒绝，不静默全表"
+        );
     }
 }

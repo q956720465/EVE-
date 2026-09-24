@@ -31,6 +31,8 @@ base64 = "0.22"
 sha2 = "0.10"
 urlencoding = "2"
 getrandom = "0.2"
+# default-features = false 只留 windows-native，避免默认拖入 linux secret-service 依赖链
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
 emd-core = { path = "crates/emd-core" }
 

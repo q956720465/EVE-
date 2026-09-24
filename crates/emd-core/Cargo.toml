@@ -21,6 +21,7 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 urlencoding = { workspace = true }
 getrandom = { workspace = true }
+keyring = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

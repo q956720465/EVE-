@@ -458,6 +458,98 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    // ---- M4a：倒卖引擎的读写装配 ------------------------------------------
+
+    /// 参数进 `meta` KV（无迁移）。非法值**拒绝**而非静默存——
+    /// 费率/技能会直接进入金额计算，"存进去再说"等于把错误口径持久化。
+    pub fn set_flip_params(&self, p: &crate::market::FlipParams) -> Result<()> {
+        let f = &p.fees;
+        let ok = f.accounting <= 5
+            && f.broker_relations <= 5
+            && (0.0..=8.0).contains(&f.sales_tax_pct)
+            && (0.0..=5.0).contains(&f.broker_pct)
+            && f.faction_standing >= 0.0
+            && f.corp_standing >= 0.0
+            && p.capital_isk > 0.0
+            && (0.0..=100.0).contains(&p.capital_pct_per_trade)
+            && p.min_batch >= 1
+            && p.freight_isk_per_unit >= 0.0
+            && p.margin_threshold_pct >= 0.0;
+        if !ok {
+            return Err(Error::Config("flip 参数越界：拒绝写入".into()));
+        }
+        let raw = serde_json::to_string(p)
+            .map_err(|e| Error::Config(format!("flip 参数序列化失败: {e}")))?;
+        self.set_meta("flip_params", &raw)
+    }
+
+    /// 无记录 → 官方默认口径；解析失败同样回默认并告警——
+    /// 参数坏掉不该把整个扫描器点崩。
+    pub fn get_flip_params(&self) -> Result<crate::market::FlipParams> {
+        let Some(raw) = self.get_meta("flip_params")? else {
+            return Ok(crate::market::FlipParams::default());
+        };
+        match serde_json::from_str::<crate::market::FlipParams>(&raw) {
+            Ok(p) => Ok(p),
+            Err(e) => {
+                tracing::warn!(error = %e, "flip_params 解析失败，回落默认口径");
+                Ok(crate::market::FlipParams::default())
+            }
+        }
+    }
+
+    /// 当前快照的全部单簿 → `StationOrderBook`（flip 扫描的输入装配）。
+    /// station_orders 存的是聚合结果，这里反读：depth JSON 反序列化，
+    /// `skipped_*`/`is_npc` 原样带回（UI 展示用）。
+    pub fn load_books(&self) -> Result<Vec<StationOrderBook>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT location_id, type_id, is_npc, best_bid, bid_qty, best_ask, ask_qty,
+                    bid_levels, ask_levels, bid_depth, ask_depth,
+                    skipped_stale, skipped_thin, skipped_wholesale
+             FROM station_orders",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(StationOrderBook {
+                location_id: r.get::<_, i64>(0)? as u64,
+                type_id: r.get::<_, i64>(1)? as u32,
+                is_npc_station: r.get::<_, i64>(2)? != 0,
+                best_bid: r.get(3)?,
+                bid_qty: r.get::<_, i64>(4)? as u64,
+                best_ask: r.get(5)?,
+                ask_qty: r.get::<_, i64>(6)? as u64,
+                bid_levels: r.get(7)?,
+                ask_levels: r.get(8)?,
+                bid_depth: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                ask_depth: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default(),
+                skipped_stale: r.get(11)?,
+                skipped_thin: r.get(12)?,
+                skipped_wholesale: r.get(13)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 24h 成交量候选（spec §2.3）：每类型取**各自**最新一日的 volume。
+    /// 用全局 MAX(date) 会把"只有旧数据的类型"整类丢掉；多星域同日的
+    /// 稀有情形按 volume 求和（T3 实际只采吉他所在域，影响可忽略）。
+    pub fn latest_vol24(&self) -> Result<std::collections::HashMap<u32, u64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.type_id, SUM(m.volume) FROM market_history m
+             JOIN (SELECT type_id, MAX(date) AS d FROM market_history GROUP BY type_id) x
+               ON x.type_id = m.type_id AND x.d = m.date
+             GROUP BY m.type_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u64))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 距最近一轮的秒数（快照年龄）。没有轮次 → None，调用方显示"先跑采集"。
+    pub fn last_round_age_secs(&self) -> Result<Option<i64>> {
+        Ok(self.last_round()?.map(|r| (now_unix() - r.started_at).max(0)))
+    }
+
     pub fn remember_station(&self, location_id: u64, is_npc: bool) -> Result<()> {
         self.conn.execute(
             "INSERT INTO stations (location_id, is_npc) VALUES (?1, ?2)
@@ -1634,5 +1726,105 @@ mod tests {
         assert!(now_unix() > 1_700_000_000);
         assert!(now_unix() < 4_000_000_000);
         let _ = Duration::seconds(1);
+    }
+}
+
+/// M4a 倒卖引擎的读写装配测试（独立模块，避免动上面的大测试块）。
+#[cfg(test)]
+mod flip_persist_tests {
+    use super::*;
+    use crate::market::{FlipParams, PriceLevel, StationOrderBook};
+
+    fn sample_book() -> StationOrderBook {
+        StationOrderBook {
+            location_id: crate::market::STATION_JITA,
+            type_id: 34,
+            is_npc_station: true,
+            best_bid: Some(3.9),
+            bid_qty: 80,
+            best_ask: Some(4.0),
+            ask_qty: 100,
+            bid_levels: 3,
+            ask_levels: 5,
+            bid_depth: vec![PriceLevel { price: 3.9, volume: 80, orders: 3 }],
+            ask_depth: vec![
+                PriceLevel { price: 4.0, volume: 100, orders: 4 },
+                PriceLevel { price: 4.1, volume: 50, orders: 1 },
+            ],
+            skipped_stale: 2,
+            skipped_thin: 1,
+            skipped_wholesale: 0,
+        }
+    }
+
+    #[test]
+    fn flip_params_roundtrip_via_meta() {
+        let db = Db::in_memory().unwrap();
+        let mut p = FlipParams::default();
+        p.fees.accounting = 3;
+        p.margin_threshold_pct = 5.0;
+        db.set_flip_params(&p).unwrap();
+        assert_eq!(db.get_flip_params().unwrap(), p);
+    }
+
+    #[test]
+    fn flip_params_default_when_absent() {
+        let db = Db::in_memory().unwrap();
+        assert_eq!(db.get_flip_params().unwrap(), FlipParams::default());
+    }
+
+    #[test]
+    fn flip_params_rejects_invalid_without_partial_write() {
+        let db = Db::in_memory().unwrap();
+        let mut p = FlipParams::default();
+        p.fees.accounting = 9;
+        assert!(db.set_flip_params(&p).is_err(), "技能越界必须拒绝");
+        let mut p2 = FlipParams::default();
+        p2.margin_threshold_pct = -1.0;
+        assert!(db.set_flip_params(&p2).is_err());
+        let mut p3 = FlipParams::default();
+        p3.fees.broker_pct = 9.0;
+        assert!(db.set_flip_params(&p3).is_err());
+        assert_eq!(db.get_flip_params().unwrap(), FlipParams::default(), "失败不得留下半份参数");
+    }
+
+    #[test]
+    fn load_books_roundtrips_snapshot_depths() {
+        let db = Db::in_memory().unwrap();
+        let book = sample_book();
+        db.write_snapshot(std::slice::from_ref(&book), Some("lm")).unwrap();
+        let back = db.load_books().unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0], book, "depth JSON/标记/跳过计数须逐字段还原");
+    }
+
+    #[test]
+    fn latest_vol24_takes_most_recent_date_per_type() {
+        let db = Db::in_memory().unwrap();
+        let row = |ty: u32, date: &str, vol: u64| HistoryRow {
+            region_id: crate::market::REGION_FORGE,
+            type_id: ty,
+            date: date.into(),
+            average: None,
+            highest: None,
+            lowest: None,
+            volume: vol,
+            order_count: 1,
+        };
+        db.write_history(&[
+            row(34, "2026-09-22", 100),
+            row(34, "2026-09-24", 555),
+            row(35, "2026-09-20", 77),
+        ])
+        .unwrap();
+        let v = db.latest_vol24().unwrap();
+        assert_eq!(v.get(&34), Some(&555), "取该类型自己的最新日");
+        assert_eq!(v.get(&35), Some(&77), "旧数据的类型不被整类丢掉");
+    }
+
+    #[test]
+    fn last_round_age_absent_before_any_round() {
+        let db = Db::in_memory().unwrap();
+        assert_eq!(db.last_round_age_secs().unwrap(), None);
     }
 }

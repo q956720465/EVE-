@@ -278,7 +278,76 @@ CREATE TABLE xregion_log (
 );
 CREATE INDEX ix_xregion_log_started ON xregion_log (started_at DESC);
 "#,
-)];
+),
+(
+    6,
+    "M4c：角色挂链元数据、钱包流水/挂单快照、亏损告警状态机",
+    r#"
+-- 角色挂链元数据。**无令牌列**：refresh_token 只进 keyring（spec §4.1）。
+CREATE TABLE char_meta (
+    char_id        INTEGER PRIMARY KEY,
+    name           TEXT,
+    tx_cursor      TEXT,            -- wallet/transactions 的 since 增量水位（ISO8601）
+    journal_cursor TEXT,            -- wallet/journal 的 since 增量水位
+    orders_lm      TEXT,            -- 上轮 orders 的 Last-Modified，同源凭据
+    first_sync_at  INTEGER,
+    last_sync_at   INTEGER
+);
+
+-- 钱包流水缓存（transactions）：FIFO 成本基准的原料。
+-- 保留期由调用层裁剪（90 天 = spec §4.2 的首启回填窗）；主键不含时间戳。
+CREATE TABLE char_tx (
+    char_id        INTEGER NOT NULL,
+    transaction_id INTEGER NOT NULL,
+    date           TEXT    NOT NULL,
+    type_id        INTEGER NOT NULL,
+    location_id    INTEGER NOT NULL,
+    is_buy         INTEGER NOT NULL,
+    unit_price     REAL    NOT NULL,
+    quantity       INTEGER NOT NULL,
+    PRIMARY KEY (char_id, transaction_id)
+);
+CREATE INDEX ix_char_tx_type ON char_tx (char_id, type_id, date);
+
+-- 上轮挂单快照：供状态边沿判定（"首次转负才告警"要能对比上一轮）。
+CREATE TABLE char_orders (
+    char_id       INTEGER NOT NULL,
+    order_id      INTEGER NOT NULL,
+    type_id       INTEGER NOT NULL,
+    location_id   INTEGER NOT NULL,
+    is_buy        INTEGER NOT NULL,
+    price         REAL    NOT NULL,
+    volume_remain INTEGER NOT NULL,
+    issued        TEXT    NOT NULL,
+    duration      INTEGER NOT NULL,
+    fetched_at    INTEGER NOT NULL,
+    PRIMARY KEY (char_id, order_id)
+);
+CREATE INDEX ix_char_orders_type ON char_orders (char_id, type_id);
+
+-- 告警状态机（spec §4.4）。alert_key = 挂单轨 order_id / 已实现轨 transaction_id。
+CREATE TABLE alerts (
+    alert_key          TEXT    PRIMARY KEY,
+    kind               TEXT    NOT NULL,     -- expected_sell_loss/realized_loss/buy_order_trap
+    char_id            INTEGER NOT NULL,
+    type_id            INTEGER NOT NULL,
+    location_id        INTEGER NOT NULL,
+    is_buy             INTEGER NOT NULL,
+    first_seen_at      INTEGER NOT NULL,
+    last_seen_at       INTEGER NOT NULL,
+    last_loss_isk      REAL    NOT NULL DEFAULT 0,
+    last_margin_pct    REAL    NOT NULL DEFAULT 0,
+    notified_at        INTEGER,
+    notified_day       TEXT,
+    notified_count_day INTEGER NOT NULL DEFAULT 0,
+    last_notified_loss REAL,
+    state              TEXT    NOT NULL,     -- new/notified/cleared
+    payload            TEXT    NOT NULL      -- AlertPayload JSON：与推送共用同一序列化
+);
+CREATE INDEX ix_alerts_state ON alerts (state, last_seen_at DESC);
+"#,
+),
+];
 
 #[cfg(test)]
 mod tests {
@@ -289,7 +358,7 @@ mod tests {
         for w in MIGRATIONS.windows(2) {
             assert!(w[0].0 < w[1].0, "迁移版本必须递增：{:?}", w);
         }
-        assert_eq!(MIGRATIONS.len(), 5);
+        assert_eq!(MIGRATIONS.len(), 6);
     }
 
     #[test]
@@ -311,10 +380,24 @@ mod tests {
 
     #[test]
     fn bounded_tables_never_key_on_a_timestamp() {
-        // station_orders / hub_pool / xregion_books / opportunities 都是"只留最新一轮/
-        // 有界"的表。一旦让 ts 进入主键，它们就退化成 v3.0 那种 47 GB 的追加表。
+        // station_orders / hub_pool / xregion_books / opportunities / char_orders / alerts
+        // 都是"只留最新一轮/有界"的表。一旦让 ts 进入主键，它们就退化成 v3.0 那种
+        // 47 GB 的追加表。
+        //
+        // char_orders 与 station_orders 同纪律：每轮整表替换；alerts 是状态机，
+        // 挂单轨/已实现轨各**只留当前那一行**、按 alert_key 就地更新——两者若让
+        // 时间戳进主键，同一根挂单每天会多攒一行"亏损历史"。
+        // char_meta 按 char_id 一角色一行、char_tx 按 (char_id, transaction_id) 幂等，
+        // 都是以 id 为键的有界写入，本测试对它们无意义（列进来只是噪声）。
         for (version, _, sql) in MIGRATIONS {
-            for table in ["station_orders", "hub_pool", "xregion_books", "opportunities"] {
+            for table in [
+                "station_orders",
+                "hub_pool",
+                "xregion_books",
+                "opportunities",
+                "char_orders",
+                "alerts",
+            ] {
                 if let Some(rest) = sql.split(&format!("CREATE TABLE {table}")).nth(1) {
                     let body = rest.split("CREATE ").next().unwrap_or(rest);
                     let pk = body
@@ -379,5 +462,27 @@ mod tests {
             .unwrap();
         assert!(x.contains("PRIMARY KEY (location_id, type_id)"));
         assert!(x.contains("fetched_at"), "读取端要按年龄闸门过滤");
+    }
+
+    #[test]
+    fn migration_v6_char_tables_are_bounded_and_token_free() {
+        let sql = MIGRATIONS[5].2;
+        // 令牌绝不在库里：这条断言是 Global Constraints 的机械保证
+        for t in ["char_meta", "char_tx", "char_orders", "alerts"] {
+            let body = sql.split(&format!("CREATE TABLE {t}")).nth(1).unwrap()
+                .split("CREATE ").next().unwrap();
+            assert!(!body.contains("token"), "{t} 不得有令牌列：{body}");
+        }
+        assert!(sql.contains("PRIMARY KEY (char_id, order_id)"), "char_orders 按角色+订单号");
+        assert!(sql.contains("PRIMARY KEY (char_id, transaction_id)"), "char_tx 按角色+流水号");
+    }
+
+    #[test]
+    fn alerts_key_is_alert_key_and_has_notify_fields() {
+        let sql = MIGRATIONS[5].2;
+        let a = sql.split("CREATE TABLE alerts").nth(1).unwrap()
+            .split("CREATE INDEX").next().unwrap();
+        assert!(a.contains("alert_key"), "挂单轨 order_id / 已实现轨 transaction_id 统一叫 alert_key");
+        assert!(a.contains("notified_day") && a.contains("notified_count_day"), "日限额需要自然日字段");
     }
 }

@@ -1689,10 +1689,10 @@ mod tests {
     #[test]
     fn migration_is_idempotent_and_reports_version() {
         let db = Db::in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
     }
 
     #[test]

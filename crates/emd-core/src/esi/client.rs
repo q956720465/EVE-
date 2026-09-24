@@ -238,8 +238,16 @@ impl EsiClient {
     /// 独立入口（而不是给 client 挂一个全局令牌）是为了让"公开请求永不携带令牌"成为类型事实：
     /// 令牌只从这一个入参流进请求构造，公开路径根本没有拿它的地方。
     ///
-    /// 缓存键仍是 URL（不含令牌）。这没有问题且是刻意的：角色端点的路径自带 character_id，
+    /// **前提：只传"路径里自带 per-character 标识"的角色端点**，如 `/characters/123/orders/`。
+    /// 缓存键仍是 URL（不含令牌）之所以安全，正是因为这个前提：路径里的 character_id 就是身份，
     /// 同一角色换了令牌拿到的还是同一份数据，不会串号。
+    ///
+    /// 反例（**不要**用它）：`GET /oauth/verify` 这类"令牌限定、但路径里没有身份"的端点 ——
+    /// 同一 URL 先用令牌 A 拉过，再用令牌 B 拉，未到 `Expires` 时会直接命中 A 的缓存体，
+    /// 在夹取上限 6 分钟内把 B 误判成 A。这类端点必须绕开本入口。
+    ///
+    /// 也**不要**把令牌折进缓存键来"修"上面这点：令牌一轮换（refresh 换发 access token），
+    /// 同一角色的缓存就全部作废、同一份数据被反复重拉，而"跨令牌轮换复用"正是当前形状的理由。
     pub async fn fetch_auth(&self, path_and_query: &str, token: &str) -> Result<Fetch> {
         self.fetch_inner(path_and_query, false, Some(token)).await
     }

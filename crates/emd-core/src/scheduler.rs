@@ -140,6 +140,11 @@ impl Scheduler {
             );
             cfg.interval = MIN_INTERVAL;
         }
+        // 运行期 kill switch：`EMD_XREGION=0` 关掉 T1.5（serve / Tauri 壳都经此归一，
+        // 与 interval 归一同一先例）。默认值本身仍不读 env，测试与 from_env 的语义不变。
+        if let Ok(v) = std::env::var("EMD_XREGION") {
+            cfg.xregion.enabled = v != "0";
+        }
         let (tx, rx) = watch::channel(RoundState::default());
         Self {
             client,
@@ -383,6 +388,11 @@ impl Scheduler {
     /// 跑一趟 T1.5：上一轮命中的 Top N 候选 × 三枢纽定向补拉 → 聚合 → 落 xregion_books。
     /// `Ok(None)` = 无候选（0 机会的快照，或没跑过采集）——不是错误。
     pub async fn run_t1_5(&self) -> Result<Option<XRegionReport>> {
+        // 守 enabled 是防御性：run() 主循环的钩子已查过，但直接调用方（daemon xregion、
+        // 测试）也要被同一个开关管住。
+        if !self.cfg.xregion.enabled {
+            return Ok(None);
+        }
         let books = self.db.load_books()?;
         let hubs = self.db.flip_hubs()?;
         let vol = self.db.latest_vol24()?;
@@ -447,13 +457,18 @@ impl Scheduler {
                 }
             }
             if fetched.is_empty() {
+                // 配错枢纽 ID 的显式兜底：整站一个类型都没拉成功也要喊出来，
+                // 别让 T1.5 静默空转（region id 手滑时尤其致命）。
+                tracing::error!(
+                    "T1.5 枢纽 {hub}（region {region}）本批 0 类型拉成功——检查 region 与站 ID 是否配对"
+                );
                 continue;
             }
             rep.books_written += self
                 .db
                 .write_xregion_books(hub, region, &fetched, &hub_books)?;
             self.db.remember_station(hub, true)?;
-            // 配错枢纽 ID 的显式兜底：整站零本就必须喊出来，别让 T1.5 静默空转。
+            // 拉到了类型但聚合后整站 0 本单簿 = 站 ID 与真实枢纽不符（订单都在别的站）。
             if hub_books.is_empty() {
                 tracing::error!(
                     "T1.5 枢纽 {hub}（region {region}）本批 0 本单簿——疑似站 ID 与真实枢纽不符"

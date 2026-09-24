@@ -817,9 +817,10 @@ fn run_flip(db: &Db, top: u32, acct: Option<u8>, br: Option<u8>) -> Result<()> {
         let bn = db.station_name(o.sell_loc)?.unwrap_or_else(|| o.sell_loc.to_string());
         let vsrc = if o.vol_source == market::VolSource::History { " " } else { "*" };
         // 任一站在 xregion_ages 里 = 跨区行；两站取"最老"那份数据的时间戳算年龄。
+        // 按 (站, 类型) 查，避免部分类型拉失败时角标低估年龄。
         let xregion_badge: String = [o.buy_loc, o.sell_loc]
             .iter()
-            .filter_map(|l| ages.get(l).copied())
+            .filter_map(|l| ages.get(&(*l, o.type_id)).copied())
             .min()
             .map(|ts| {
                 let secs = (now - ts).max(0);
@@ -830,7 +831,12 @@ fn run_flip(db: &Db, top: u32, acct: Option<u8>, br: Option<u8>) -> Result<()> {
         println!(
             "{:<30} {:<34} {:>12} {:>12} {:>8} {:>8.2}% {:>14} {:>8}{}",
             tname,
-            ellipsis(&format!("{an}→{bn}{xregion_badge}"), 34),
+            // 角标拼在 ellipsis 之外：站名 45 字符时 badge 不能被截断吃掉。
+            format!(
+                "{}{}",
+                ellipsis(&format!("{an}→{bn}"), 34),
+                xregion_badge
+            ),
             fmt_price(o.buy_price),
             fmt_price(o.sell_price),
             o.qty,

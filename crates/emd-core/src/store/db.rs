@@ -1371,7 +1371,8 @@ impl Db {
 
     /// 保存或更新一行机会生命周期记录。三维主键 `(type_id, buy_loc, sell_loc)`
     /// 即 opportunity_key：字段本身稳定、可读、可查，不用哈希。
-    /// `first_seen_at` 故意不参与 UPSERT 更新——它记录的是这条机会**首次登记**的时刻。
+    /// `first_seen_at` 随 UPSERT 一起更新——它与 `tick()` 的"复现即新生命周期"语义对齐，
+    /// 记录的是**当前这段活跃期**的首次登记时刻，不是历史首次。
     pub fn save_opp(&self, r: &crate::market::lifecycle::OppRecord) -> Result<()> {
         self.conn.execute(
             "INSERT INTO opportunities (
@@ -1381,6 +1382,7 @@ impl Db {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(type_id, buy_loc, sell_loc) DO UPDATE SET
                state=excluded.state, miss_streak=excluded.miss_streak,
+               first_seen_at=excluded.first_seen_at,
                last_seen_at=excluded.last_seen_at,
                best_margin_pct=excluded.best_margin_pct, last_margin_pct=excluded.last_margin_pct,
                last_net_total=excluded.last_net_total, last_qty=excluded.last_qty,
@@ -1542,13 +1544,18 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// 供 UI/daemon 给跨区行标注数据年龄：站 → 最近一次抓取时刻。
-    pub fn xregion_ages(&self) -> Result<std::collections::HashMap<u64, i64>> {
+    /// 供 UI/daemon 给跨区行标注数据年龄：(站, 类型) → 最近一次抓取时刻。
+    /// 按类型分组是诚实口径——部分类型拉失败时，旧行仍在 45 min 闸门内参与配对，
+    /// 若只按站聚合 MAX(fetched_at) 会把"这个类型其实 40 分钟前"显示成"1 分钟前"。
+    pub fn xregion_ages(&self) -> Result<std::collections::HashMap<(u64, u32), i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT location_id, MAX(fetched_at) FROM xregion_books GROUP BY location_id",
+            "SELECT location_id, type_id, MAX(fetched_at) FROM xregion_books GROUP BY location_id, type_id",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)?))
+            Ok((
+                (r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u32),
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -2164,9 +2171,11 @@ mod lifecycle_persist_tests {
         };
         db.save_opp(&r).unwrap();
         assert_eq!(db.load_opps().unwrap(), vec![r.clone()]);
-        // 同 key 再存 = UPSERT（不是新行；主键即三维复合键）
+        // 同 key 再存 = UPSERT（不是新行；主键即三维复合键）。
+        // first_seen_at 随 UPSERT 更新——它与 tick() 的"复现即新生命周期"语义对齐。
         db.save_opp(&OppRecord {
             state: OppState::Notified,
+            first_seen_at: 180,
             last_seen_at: 250,
             ..r.clone()
         })
@@ -2174,7 +2183,7 @@ mod lifecycle_persist_tests {
         let all = db.load_opps().unwrap();
         assert_eq!(all.len(), 1, "三维主键去重");
         assert_eq!(all[0].state, OppState::Notified, "字段随 UPSERT 更新");
-        assert_eq!(all[0].first_seen_at, 100, "first_seen 是首次登记时刻，UPSERT 不覆盖");
+        assert_eq!(all[0].first_seen_at, 180, "复现即新生命周期：first_seen_at 随 UPSERT 重置");
         // 把主键换到 expired 状态；剪枝只碰终态且久未见的行。
         db.save_opp(&OppRecord {
             state: OppState::Expired,

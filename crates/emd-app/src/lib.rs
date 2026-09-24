@@ -207,9 +207,10 @@ impl AppState {
                     .map_err(err)?
                     .unwrap_or_else(|| format!("站点 #{}", o.sell_loc));
                 // 两站任一在 xregion_ages 里 = 跨区行；取"最老"那份时间戳（=min）算年龄。
+                // 按 (站, 类型) 查，避免部分类型拉失败时角标低估年龄。
                 let xregion_age_secs = [o.buy_loc, o.sell_loc]
                     .iter()
-                    .filter_map(|l| ages.get(l).copied())
+                    .filter_map(|l| ages.get(&(*l, o.type_id)).copied())
                     .min()
                     .map(|ts| (now - ts).max(0));
                 rows.push(FlipRow {

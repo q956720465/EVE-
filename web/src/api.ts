@@ -300,7 +300,7 @@ function fixSettle(buy: number, sell: number, qty: number): TrialOut {
 
 /**
  * 演示快照：只有价/量是冻着的常数（模拟一份采集结果），净利数字一律现算。
- * 固定 3 行、不模拟引擎的机会筛选（min_batch/资金/阈值）——预览看的是
+ * 固定 4 行、不模拟引擎的机会筛选（min_batch/资金/阈值）——预览看的是
  * "改参数 → 角标与数字即时变化"；筛选行为以真机为准。
  */
 const FIX_ROWS: Array<Omit<FlipRow, "net_per_unit" | "net_total" | "margin_pct">> = [
@@ -330,10 +330,11 @@ const FIX_ROWS: Array<Omit<FlipRow, "net_per_unit" | "net_total" | "margin_pct">
   },
   {
     // 跨区示例：Amarr 站数据来自上一批 T1.5，前端渲染 [跨区 5 分钟前] 角标。
+    // 卖价 4.60 在默认 7.5%+3% 费率下净利 ≈ +4.5%，与"机会"语义一致（不是亏损）。
     type_id: 34, type_name: "Tritanium",
     buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
     sell_loc: 60008494, sell_loc_name: "Amarr VIII (Oris) - Emperor Family Academy",
-    buy_price: 3.94, sell_price: 4.28, qty: 380_000,
+    buy_price: 3.94, sell_price: 4.60, qty: 380_000,
     vol24: 1_240_000_000, vol_source: "history", buy_levels: 24, sell_levels: 8,
     xregion_age_secs: 305,
   },

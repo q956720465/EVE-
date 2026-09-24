@@ -5,15 +5,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use emd_core::alert::{AlertKind, AlertRecord};
 use emd_core::catalog;
 use emd_core::collector::InstanceLock;
 use emd_core::compliance;
-use emd_core::config::EsiConfig;
+use emd_core::config::{CharConfig, EsiConfig};
 use emd_core::esi::EsiClient;
 use emd_core::market::history::{self, HistoryConfig};
 use emd_core::market::{self, STATION_JITA};
-use emd_core::scheduler::{Scheduler, SchedulerConfig, Stage, XRegionConfig};
-use emd_core::store::{now_unix, Db, PriceRow};
+use emd_core::scheduler::{
+    Scheduler, SchedulerConfig, Stage, XRegionConfig, KEYRING_ACCOUNT, KEYRING_SERVICE,
+};
+use emd_core::sso::flow::char_from_access_token;
+use emd_core::sso::store::{KeyringTokenStore, TokenStore};
+use emd_core::sso::token::TokenSet;
+use emd_core::store::{now_unix, CharMeta, Db, PriceRow};
 use emd_core::tree;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -34,6 +40,8 @@ enum Command {
     Flip,
     XRegion,
     Opps,
+    Alerts,
+    Char,
 }
 
 #[derive(Debug)]
@@ -54,10 +62,16 @@ struct Args {
     /// flip 专用：临时覆盖技能等级做口径对比（不持久化）。
     accounting: Option<u8>,
     broker_relations: Option<u8>,
-    /// opps 专用：--update 打开每轮生命周期结算后再展示。
+    /// opps/alerts 专用：--update 先跑一轮再展示（opps 结算生命周期，alerts 跑告警回合）。
     do_update: bool,
     /// opps 专用：按状态过滤（new/notified/expired/invalidated）。
     state: Option<String>,
+    /// alerts 专用：按形态过滤（expected_sell_loss/buy_order_trap/realized_loss）。
+    kind: Option<String>,
+    /// char 专用：打印挂链状态（不带参数时也是这个动作）。
+    status: bool,
+    /// char 专用：--logout 清系统凭据库里的令牌。
+    logout: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -84,6 +98,9 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
     let mut broker_relations: Option<u8> = None;
     let mut do_update = false;
     let mut state: Option<String> = None;
+    let mut kind: Option<String> = None;
+    let mut status = false;
+    let mut logout = false;
 
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -103,6 +120,8 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
             "flip" => cmd = Some(Command::Flip),
             "xregion" => cmd = Some(Command::XRegion),
             "opps" => cmd = Some(Command::Opps),
+            "alerts" => cmd = Some(Command::Alerts),
+            "char" => cmd = Some(Command::Char),
             "--db" => db = PathBuf::from(it.next().context("--db 缺参数")?),
             "--word" => word = it.next().context("--word 缺参数")?,
             "--type" => {
@@ -167,12 +186,23 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
                     .with_context(|| format!("--state 需要 new/notified/expired/invalidated，收到 {v}"))?;
                 state = Some(v);
             }
+            "--kind" => {
+                let v = it.next().context("--kind 缺参数")?;
+                // 与 --state 同一条纪律：未知形态当场拒绝，不静默全表 ——
+                // `alerts --kind typo` 默默打出三类告警，用户会以为筛选后的就是这些。
+                AlertKind::parse(&v).with_context(|| {
+                    format!("--kind 需要 expected_sell_loss/buy_order_trap/realized_loss，收到 {v}")
+                })?;
+                kind = Some(v);
+            }
+            "--status" => status = true,
+            "--logout" => logout = true,
             other => anyhow::bail!("未知参数：{other}"),
         }
     }
 
     Ok(Args {
-        command: cmd.context("缺少子命令（round|serve|prices|verify|probe|stats|hubs|jita|names|tree|search|list|history|flip|xregion|opps）")?,
+        command: cmd.context("缺少子命令（round|serve|prices|verify|probe|stats|hubs|jita|names|tree|search|list|history|flip|xregion|opps|alerts|char）")?,
         db,
         region,
         ua,
@@ -187,6 +217,9 @@ fn parse_from(it: impl Iterator<Item = String>) -> Result<Args> {
         broker_relations,
         do_update,
         state,
+        kind,
+        status,
+        logout,
     })
 }
 
@@ -210,6 +243,8 @@ fn print_usage() {
   flip     倒卖扫描（读本地快照）：Top N 机会 + 丢弃原因分布；费率与技能取面板参数
   xregion  手工触发一趟 T1.5 跨区补拉（三枢纽 × Top 候选；serve 里隔轮自动跑）
   opps     打印机会生命周期表；--update 先跑一轮结算再展示；--state 过滤
+  alerts   打印告警表（形态/类型/站点/亏损额/margin/状态/通知计数）；--update 先跑一轮告警回合；--kind 过滤
+  char     查看或退出角色挂链：默认打印挂链状态与同步水位（同 --status）；--logout 清系统凭据库里的令牌
   names    解析库里未命名的 NPC 站（POST /v1/universe/names）
   tree     一次性建分类树（约 1 000 次请求，实测 1-2 分钟）
   search   按名称搜类型（--word，走 POST /v1/universe/ids，只取 inventory_types）
@@ -221,13 +256,17 @@ fn print_usage() {
   --top N      --limit 的别名（flip 的 Top N，缺省 20）
   --accounting N        flip 临时覆盖 Accounting 等级（0-5，仅本次运行，不写库）
   --broker-relations N  flip 临时覆盖 Broker Relations 等级（0-5，仅本次运行，不写库）
-  --update     opps 展示前先跑一轮 update_round（把当前快照结算进 opportunities）
+  --update     opps/alerts 展示前先跑一轮：opps 结算生命周期，alerts 跑角色同步+告警回合
   --state S    opps 按状态过滤：new | notified | expired | invalidated
+  --kind K     alerts 按形态过滤：expected_sell_loss | buy_order_trap | realized_loss
+  --status     char 打印挂链状态（不带参数时的默认动作）
+  --logout     char 退出登录：清掉系统凭据库里的 SSO 令牌（库内角色数据与告警表不动）
   --type N     history 只取这一个类型
   --dry        history 只打印取数计划与成本估算，不发请求
   --probe      history 的交叉实验：证明 history 不占 market-order 令牌组
 
-  环境变量：EMD_CONTACT_EMAIL（UA 里的联系邮箱）、EMD_HISTORY_CAP（0 = 关掉每日 T3）"
+  环境变量：EMD_CONTACT_EMAIL（UA 里的联系邮箱）、EMD_HISTORY_CAP（0 = 关掉每日 T3）、
+            EMD_CHAR_CLIENT_ID（角色挂链的 SSO client_id，配了才启用同步）"
     );
 }
 
@@ -274,6 +313,15 @@ async fn main() -> Result<()> {
         Command::Flip => run_flip(&db, args.limit.unwrap_or(20), args.accounting, args.broker_relations)?,
         Command::XRegion => run_xregion(&client, &db).await?,
         Command::Opps => run_opps(&db, args.do_update, args.state.as_deref())?,
+        Command::Alerts => run_alerts(&client, &db, args.do_update, args.kind.as_deref()).await?,
+        Command::Char => run_char(
+            &db,
+            // P2：与登录/调度器**同一对**凭据坐标（常量只有一处定义）—— 这里若自己拼一对
+            // 新的 service/account，读到的就是另一条空条目，现象是"明明登录过却一直没令牌"。
+            &KeyringTokenStore::new(KEYRING_SERVICE, KEYRING_ACCOUNT),
+            args.status,
+            args.logout,
+        )?,
         Command::Jita => run_jita(&db, args.limit.unwrap_or(20))?,
         Command::Names => {
             let n = catalog::resolve_missing(&client, &db, args.limit.unwrap_or(400)).await?;
@@ -951,6 +999,289 @@ fn run_opps(db: &Db, do_update: bool, state: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// M4c：告警表与角色挂链的运维面（T13）
+// ---------------------------------------------------------------------------
+
+/// 告警表：形态 / 类型 / 站点 / 亏损额 / margin / 状态 / 通知计数，表尾给全表按形态的计数
+/// —— 带 `--kind` 过滤时也看得见"另外两类各有多少"，否则无从判断过滤是否符合预期。
+///
+/// `--update` 先跑一轮告警回合（[`run_alert_round`]）再展示；`--kind` 的取值已在解析期认过。
+async fn run_alerts(
+    client: &Arc<EsiClient>,
+    db: &Arc<Db>,
+    do_update: bool,
+    kind: Option<&str>,
+) -> Result<()> {
+    if do_update {
+        run_alert_round(client, db).await?;
+    }
+    let filter = match kind {
+        Some(k) => Some(
+            AlertKind::parse(k).with_context(|| format!("--kind 未知值 {k}"))?,
+        ),
+        None => None,
+    };
+    let rows = db.load_alerts()?;
+    if rows.is_empty() {
+        // 空表不是错误：还没登录/还没跑过告警回合。指个下一步，别让用户对着空屏猜。
+        println!("告警表为空 —— 先跑 serve（每轮自动跑一次告警回合），或 alerts --update 手工跑一轮。");
+        return Ok(());
+    }
+    let shown: Vec<&AlertRecord> = rows
+        .iter()
+        .filter(|r| filter.map_or(true, |f| r.kind == f))
+        .collect();
+    if shown.is_empty() {
+        println!("--kind {} 没有命中的行。", kind.unwrap_or_default());
+    } else {
+        println!(
+            "{:<20} {:<26} {:<30} {:>14} {:>10} {:<9} {}",
+            "形态", "类型", "站点", "亏损额", "margin%", "状态", "通知(day×count@at)"
+        );
+        for r in &shown {
+            let tname = db.type_name(r.type_id)?.unwrap_or_else(|| r.type_id.to_string());
+            let sname = db
+                .station_name(r.location_id)?
+                .unwrap_or_else(|| r.location_id.to_string());
+            // 与 opps 同一套通知史文本：没推过就是 "-"，推过就带当日的 day×count 与时刻。
+            let notify = match (r.notified_at, r.notified_day.as_deref()) {
+                (Some(at), Some(day)) => format!("{day}x{}@{at}", r.notified_count_day),
+                (Some(at), None) => format!("@{at}"),
+                _ => "-".into(),
+            };
+            println!(
+                "{:<20} {:<26} {:<30} {:>14} {:>9.2}% {:<9} {}",
+                r.kind.as_str(),
+                ellipsis(&tname, 26),
+                ellipsis(&sname, 30),
+                fmt_price(r.last_loss_isk),
+                r.last_margin_pct,
+                r.state.as_str(),
+                notify,
+            );
+        }
+    }
+    // 逐形态数出来而不是只数命中的那一类：三类的分母都在这一行里。走 `AlertKind::ALL`
+    // 于是"0 条"也会露面 —— 缺的那一类不是被过滤掉了，而是本来就没有。
+    let totals: Vec<String> = AlertKind::ALL
+        .iter()
+        .map(|k| {
+            format!(
+                "{} {}",
+                k.as_str(),
+                rows.iter().filter(|r| r.kind == *k).count()
+            )
+        })
+        .collect();
+    println!("显示 {} 行｜全表按形态：{}", shown.len(), totals.join("｜"));
+    Ok(())
+}
+
+/// `alerts --update` 的那一轮。**复用调度器的装配**（[`Scheduler::run_char_and_alerts`]）
+/// 而不是在 daemon 里另拼一遍：令牌（过期才刷）、角色身份（从令牌自己里取）、通道装配
+/// （`PushConfig`：本地提醒中心恒在 + 钉钉按配置）三件事都在那一条路径上 —— 在 daemon 里
+/// 重写第一遍就是 M1 `round`/`serve` 分叉的重演，两边的判定与推送迟早对不上。
+///
+/// **没有令牌就不跑**（P4）。本地那一半（读库 → 判定 → 落库 → 派发）在 `alert::update_round`
+/// 里与同步共用一段**顺序契约**（P3 的 journal 真值必须紧跟同步返回、P2 的落库先于派发），
+/// 把判定侧单独拆出来重写，等于把 T12 审核过的顺序在 daemon 里再抄一遍 —— 抄错的形态是
+/// **静默少报**而不是报错。于是这里明确说"没跑、为什么"，既不伪造令牌，也不把"没登录"
+/// 打成一片 0：那样看起来像"跑过了，这个角色确实没有亏损"。
+///
+/// 通道侧不需要"没有通道"的兜底：`PushConfig::channels()` 恒含本地提醒中心（spec §4.5 的
+/// 回落方案），钉钉只在开关打开且 webhook 填了时进场；本地那条恒回 `Sent`，于是"过闸即记账"
+/// 的口径与 serve 完全一致 —— 也就不存在"拿空通道列表跑一轮"这种形态。
+async fn run_alert_round(client: &Arc<EsiClient>, db: &Arc<Db>) -> Result<()> {
+    // P1：**必须 from_env**。`CharConfig::default()` 的 char 侧是**关闭**的 —— 用它会让
+    // "配了 EMD_CHAR_CLIENT_ID、登录也成功了"的机器每轮静默跳过同步，一条日志都不解释，
+    // 用户看到的是"零告警"。
+    let cfg = CharConfig::from_env();
+    if !cfg.enabled {
+        println!(
+            "角色同步未启用（EMD_CHAR_CLIENT_ID 未配置，或 EMD_CHAR_SYNC=0）—— 本轮不做判定与推送，只展示本地告警表。"
+        );
+        return Ok(());
+    }
+    let store = KeyringTokenStore::new(KEYRING_SERVICE, KEYRING_ACCOUNT);
+    if store.load()?.is_none() {
+        println!(
+            "未登录（系统凭据库里没有 SSO 令牌）—— 同步需要访问令牌，本轮不做判定与推送；先登录再跑（不伪造令牌）。"
+        );
+        return Ok(());
+    }
+    // 两道门先自己看一眼只为把 `Ok(None)` 的形态说清楚；真正的回合仍走调度器 ——
+    // 那里面还有同一对门（关着时不碰凭据库），语义不变。
+    let sched = Scheduler::new(
+        client.clone(),
+        db.clone(),
+        SchedulerConfig {
+            char: cfg,
+            ..Default::default()
+        },
+    );
+    match sched.run_char_and_alerts().await? {
+        Some(rep) => {
+            // P5：字段照打。`pushed`/`suppressed` **不覆盖**"派发过但没有任何通道回 Sent"
+            // 那一档，所以 detected − pushed − suppressed 不是失败数，这里也不替它编一个。
+            println!(
+                "告警回合：同步 {} 行｜判定 {} 条｜推送 {} 条｜拦下 {} 条",
+                rep.synced, rep.detected, rep.pushed, rep.suppressed
+            );
+            println!(
+                "（口径：判定 = 闸门之前的命中数；拦下 = 冷却中/当日额度已尽，它们照样进提醒中心；推送只记至少一条通道确认的条目）"
+            );
+        }
+        None => println!(
+            "回合没跑：挂单快照本轮未刷新（403/断网/解析失败），判定与推送都跳过 —— 详见日志（RUST_LOG 调高可见 warn）。"
+        ),
+    }
+    Ok(())
+}
+
+/// 一个角色的挂链事实（[`render_char_status`] 的输入）。
+struct LinkFacts {
+    id: u64,
+    /// `char_meta` 的那一行；None = 行还没落（同步先于登录落行时会出现）。
+    meta: Option<CharMeta>,
+    /// `char_orders` 的当前行数（每轮整表替换的快照）。
+    orders: usize,
+    /// `char_tx` 的当前行数（老行由 `prune_char_tx` 按回填窗收口）。
+    txs: usize,
+}
+
+/// 库内已挂链的角色。角色 id 只能从 `char_meta` 的行上取 —— **令牌不在库里**，于是"没登录"
+/// 时也必须能回答"上一次挂链的是谁"（那正是排查"为什么没同步"的起点）。
+///
+/// 这里只借 `conn()` 数一遍 id，列到结构体的映射仍走存储层（`char_meta`/`load_char_*`）：
+/// 照 `run_stats` 与 `Scheduler::consecutive_failures` 的裸查询先例，本任务的改动面只有本文件。
+fn link_facts(db: &Db) -> Result<Vec<LinkFacts>> {
+    let mut stmt = db.conn().prepare("SELECT char_id FROM char_meta ORDER BY char_id")?;
+    let ids: Vec<u64> = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<i64>, _>>()?
+        .into_iter()
+        .map(|v| v as u64)
+        .collect();
+    let mut out = Vec::new();
+    for id in ids {
+        out.push(LinkFacts {
+            id,
+            meta: db.char_meta(id)?,
+            orders: db.load_char_orders(id)?.len(),
+            txs: db.load_char_tx(id, None)?.len(),
+        });
+    }
+    Ok(out)
+}
+
+/// `char` 的查看与登出。
+///
+/// `--logout` 只清系统凭据库里的令牌（[`TokenStore::clear`]）：**库内角色数据与告警表一行不动**
+/// —— 退出登录是"不用这个角色了"，不是"删掉历史"。
+///
+/// `--status`（或不带参数）打印挂链状态与同步水位；只跑 `--logout` 时不再压一屏水位
+/// （确认句给完就够），两个一起给则是"先清再看"，退出是否真的生效一眼就知道。
+fn run_char(db: &Db, store: &dyn TokenStore, status: bool, logout: bool) -> Result<()> {
+    if logout {
+        store.clear()?;
+        println!("已退出登录：系统凭据库里的 SSO 令牌已清除（库内角色数据与告警表不受影响）。");
+    }
+    if !status && logout {
+        return Ok(());
+    }
+    let cfg = CharConfig::from_env();
+    let tokens = store.load()?;
+    let links = link_facts(db)?;
+    print!("{}", render_char_status(&cfg, tokens.as_ref(), &links, now_unix()));
+    Ok(())
+}
+
+/// 挂链状态的渲染。**纯函数**（事实进、字符串出）有两个理由：一是 P3 的脱敏断言要有个能断言
+/// 的东西（测试里截不到 stdout），二是渲染不再顺手读库/读凭据库。
+///
+/// **绝不打印令牌**：access/refresh 原文、含它们的任何串都不进这里。令牌只以三种派生事实露面
+/// —— 已登录/未登录、到期时刻、以及**从它自己解出来的**角色身份。
+fn render_char_status(
+    cfg: &CharConfig,
+    tokens: Option<&TokenSet>,
+    links: &[LinkFacts],
+    now: i64,
+) -> String {
+    let mut out = String::new();
+    out.push_str("挂链状态（EMD_CHAR_* 与系统凭据库）\n");
+    out.push_str(&format!(
+        "  同步开关：{}\n",
+        if cfg.enabled {
+            format!("已启用（首启回填窗 {} 天，即同步水位与 FIFO 成本基准的窗外边界）", cfg.backfill_days)
+        } else {
+            "未启用（EMD_CHAR_CLIENT_ID 未配置，或 EMD_CHAR_SYNC=0）".to_string()
+        }
+    ));
+    match tokens {
+        None => out.push_str("  令牌：未登录（系统凭据库里没有令牌）\n"),
+        Some(t) => {
+            // 身份从**令牌自己**里解（与调度器同一判据，只解码不验签）：库里那份 `char_meta`
+            // 可能是上一个角色的行，拿它当"现在挂链的是谁"会指错人 —— 而 `fetch_auth` 的
+            // 缓存键正是路径里的这个角色 id。
+            out.push_str("  令牌：已登录");
+            match char_from_access_token(&t.access_token) {
+                Ok((id, name)) => out.push_str(&format!("（角色 {id} {name}）\n")),
+                // 形状认不出时只报形状：`sso::flow` 的报错只带段数与字段名，令牌原文一个字都不带。
+                Err(e) => out.push_str(&format!("（角色取不出：{e}）\n")),
+            }
+            // 到期**只报时刻**，不报剩余寿命以外的任何东西；已过期要说清"下一轮会先刷再同步"，
+            // 否则用户会以为这台机器已经停更。
+            if t.is_expired(now) {
+                out.push_str(&format!(
+                    "  有效期：已过期（{}）—— 下一轮同步前会先刷新\n",
+                    fmt_ts(t.expires_at)
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  有效期：{}（尚余 {}）\n",
+                    fmt_ts(t.expires_at),
+                    human(std::time::Duration::from_secs((t.expires_at - now).max(0) as u64))
+                ));
+            }
+        }
+    }
+    if links.is_empty() {
+        out.push_str("  库内挂链：没有 —— 登录后先跑一轮 serve（或 alerts --update）才会落 char_meta\n");
+        return out;
+    }
+    for l in links {
+        match &l.meta {
+            None => out.push_str(&format!("  库内挂链：角色 {} 还没落 char_meta 行\n", l.id)),
+            Some(m) => {
+                out.push_str(&format!(
+                    "  库内挂链：角色 {} {}\n",
+                    l.id,
+                    m.name.as_deref().unwrap_or("（无名）")
+                ));
+                out.push_str(&format!(
+                    "    首次同步 {}｜上次同步 {}\n",
+                    fmt_opt_ts(m.first_sync_at),
+                    fmt_age(m.last_sync_at, now)
+                ));
+                // 水位原样回显（流水/日记账是 ESI 的 ISO8601 文本，orders_lm 是 HTTP 日期原文）：
+                // 它们决定下一轮拉哪一段，看不出来就没法判断"为什么没有新数据"。
+                out.push_str(&format!(
+                    "    同步水位：流水 {}｜日记账 {}｜挂单 Last-Modified {}\n",
+                    m.tx_cursor.as_deref().unwrap_or("（无）"),
+                    m.journal_cursor.as_deref().unwrap_or("（无）"),
+                    m.orders_lm.as_deref().unwrap_or("（无）"),
+                ));
+                out.push_str(&format!(
+                    "    本地数据：挂单 {} 张｜流水 {} 行（保留期即回填窗）\n",
+                    l.orders, l.txs
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// 长名字截断，防止中文站名把表格列顶飞。
 fn ellipsis(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -1007,9 +1338,36 @@ fn human(d: std::time::Duration) -> String {
     }
 }
 
+/// Unix 秒 → `YYYY-MM-DDThh:mm:ssZ`（UTC）。推不出时刻时回显原始数字而不是猜一个时间。
+fn fmt_ts(t: i64) -> String {
+    chrono::DateTime::from_timestamp(t, 0)
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| format!("@{t}"))
+}
+
+/// `Option<时间戳>` → 文本：没给就是"（无）"（列可空，空与 0 要分得开）。
+fn fmt_opt_ts(t: Option<i64>) -> String {
+    t.map(fmt_ts).unwrap_or_else(|| "（无）".into())
+}
+
+/// 同上，但给了就带上"多久前"——水位一类的东西，年龄比时刻更说明问题。
+fn fmt_age(t: Option<i64>, now: i64) -> String {
+    match t {
+        Some(t) => format!(
+            "{}（{}前）",
+            fmt_ts(t),
+            human(std::time::Duration::from_secs((now - t).max(0) as u64))
+        ),
+        None => "（无）".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 只在测试里出现的令牌存储：生产路径用系统凭据库（`KeyringTokenStore`），
+    // 把它提到文件头会变成非测试构建下的未使用导入。
+    use emd_core::sso::store::MemoryTokenStore;
     use std::time::Duration;
 
     #[test]
@@ -1035,7 +1393,7 @@ mod tests {
         // 保证 help 里列的每个子命令都能被解析到，不会写出说明里没有（或说明里有但没实现）的命令。
         let words = [
             "round", "serve", "prices", "verify", "probe", "stats", "hubs", "jita", "names",
-            "tree", "search", "list", "history", "flip", "xregion", "opps",
+            "tree", "search", "list", "history", "flip", "xregion", "opps", "alerts", "char",
         ];
         let want = [
             Command::Round,
@@ -1054,6 +1412,8 @@ mod tests {
             Command::Flip,
             Command::XRegion,
             Command::Opps,
+            Command::Alerts,
+            Command::Char,
         ];
         for (w, x) in words.iter().zip(want.iter()) {
             let a = parse_from([w.to_string()].into_iter()).unwrap_or_else(|e| panic!("{w}: {e}"));
@@ -1108,5 +1468,133 @@ mod tests {
             parse_from(["opps", "--state", "nonsense"].into_iter().map(String::from)).is_err(),
             "未知状态当场拒绝，不静默全表"
         );
+    }
+
+    #[test]
+    fn parses_alerts_and_char() {
+        // alerts 无参可跑（只看本地表）；--update 打开告警回合；--kind 过滤，未知形态当场拒绝。
+        let a = parse_from(["alerts"].into_iter().map(String::from)).unwrap();
+        assert_eq!(a.command, Command::Alerts);
+        assert!(!a.do_update, "不带 --update 就不跑同步/判定/推送");
+        assert!(a.kind.is_none());
+
+        let b = parse_from(["alerts", "--update"].into_iter().map(String::from)).unwrap();
+        assert!(b.do_update, "--update 先跑一轮告警回合再展示");
+
+        let c = parse_from(["alerts", "--kind", "expected_sell_loss"].into_iter().map(String::from))
+            .unwrap();
+        assert_eq!(c.kind.as_deref(), Some("expected_sell_loss"));
+        assert!(
+            parse_from(["alerts", "--kind", "nonsense"].into_iter().map(String::from)).is_err(),
+            "未知形态当场拒绝，不静默全表（否则用户以为过滤生效其实没有）"
+        );
+
+        // char 的两个动作各自解析；两者互相独立（可同时给：先登出，再看清没清）。
+        let d = parse_from(["char", "--status"].into_iter().map(String::from)).unwrap();
+        assert_eq!(d.command, Command::Char);
+        assert!(d.status && !d.logout);
+        let e = parse_from(["char", "--logout"].into_iter().map(String::from)).unwrap();
+        assert_eq!(e.command, Command::Char);
+        assert!(e.logout && !e.status);
+    }
+
+    /// P3：`char --status` 的输出必须脱敏。哨兵串**真切进过渲染器** —— 角色 id 与名字是从
+    /// 这个令牌里解出来的（下面正向断言它们出现），所以"哨兵没出现"不是因为函数压根没看令牌。
+    #[test]
+    fn char_status_output_carries_no_token_material() {
+        // 合成 JWT：payload 段是 `{"sub":"CHARACTER:EVE:90000001","name":"Pilot One","exp":1790000000}`
+        // 的 base64url（无 padding），签名段塞哨兵 —— 真令牌的签名段同样是不可读的随机串。
+        const AT_SIG: &str = "AT-SENTINEL-ACCESS-TOKEN-9f3a";
+        const RT: &str = "RT-SENTINEL-REFRESH-TOKEN-7b21";
+        const PAYLOAD: &str = "eyJzdWIiOiJDSEFSQUNURVI6RVZFOjkwMDAwMDAxIiwibmFtZSI6IlBpbG90IE9uZSIsImV4cCI6MTc5MDAwMDAwMH0";
+        let at = format!("eyJhbGciOiJub25lIn0.{PAYLOAD}.{AT_SIG}");
+        let tokens = TokenSet {
+            access_token: at.clone(),
+            refresh_token: RT.to_string(),
+            expires_at: 1_790_000_000,
+        };
+        let cfg = CharConfig {
+            client_id: "test-client-id".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let meta = CharMeta {
+            char_id: 90_000_001,
+            name: Some("Pilot One".into()),
+            tx_cursor: Some("2026-09-25T11:58:00Z".into()),
+            journal_cursor: None,
+            orders_lm: Some("Wed, 17 Sep 2026 00:00:00 GMT".into()),
+            first_sync_at: Some(1_789_000_000),
+            last_sync_at: Some(1_790_000_000),
+        };
+        let links = vec![LinkFacts {
+            id: 90_000_001,
+            meta: Some(meta),
+            orders: 12,
+            txs: 340,
+        }];
+        // now 远在 expires_at 之后：走"已过期"那条分支。
+        let out = render_char_status(&cfg, Some(&tokens), &links, 1_790_003_600);
+
+        // 正向证据：令牌真被读过（身份与到期判定都是从它派生的）。
+        assert!(out.contains("90000001"), "角色 id 取自令牌：{out}");
+        assert!(out.contains("Pilot One"), "角色名取自令牌：{out}");
+        assert!(out.contains("已过期"), "到期判定由令牌的 expires_at 算出：{out}");
+        assert!(out.contains("90 天"), "回填窗取自配置：{out}");
+
+        // 本测试的要害：令牌原文一个字都不在输出里。
+        assert!(!out.contains(AT_SIG), "access_token 进输出了：{out}");
+        assert!(!out.contains(RT), "refresh_token 进输出了：{out}");
+        assert!(!out.contains(&at), "整条 access_token 进输出了：{out}");
+        assert!(!out.contains("SENTINEL"), "哨兵串进输出了：{out}");
+
+        // 形状不是 JWT 的令牌（换过序列化格式 / 凭据被手工改过）：只报"取不出角色"，
+        // 错误串里同样没有令牌（`sso::flow` 的报错只带段数与字段名）。
+        let weird = TokenSet {
+            access_token: format!("not-a-jwt-{AT_SIG}"),
+            refresh_token: RT.to_string(),
+            expires_at: 1_790_003_600,
+        };
+        let out = render_char_status(&cfg, Some(&weird), &[], 1_790_000_000);
+        assert!(out.contains("取不出"), "{out}");
+        assert!(!out.contains("SENTINEL"), "异形令牌的报错里带了原文：{out}");
+
+        // 没登录（凭据库读空）也要能回答"上一次挂链的是谁"：这是排查"为什么没同步"的起点。
+        let out = render_char_status(&cfg, None, &links, 1_790_000_000);
+        assert!(out.contains("未登录"), "{out}");
+        assert!(out.contains("Pilot One"), "库内的挂链事实与令牌无关：{out}");
+        assert!(out.contains("2026-09-25T11:58:00Z"), "水位原样回显：{out}");
+    }
+
+    #[test]
+    fn char_logout_clears_the_token_store_and_leaves_the_db_alone() {
+        let db = Db::in_memory().unwrap();
+        let store = MemoryTokenStore::default();
+        db.upsert_char_meta(90_000_001, "Pilot One", 1_790_000_000)
+            .unwrap();
+
+        // --status 是纯读：不碰凭据库，也不改库。
+        store
+            .save(&TokenSet {
+                access_token: "AT-SENTINEL".into(),
+                refresh_token: "RT-SENTINEL".into(),
+                expires_at: 0,
+            })
+            .unwrap();
+        run_char(&db, &store, true, false).unwrap();
+        assert!(store.load().unwrap().is_some(), "--status 不得动凭据库");
+        assert!(db.char_meta(90_000_001).unwrap().is_some());
+
+        // --logout 走 TokenStore::clear()：令牌没了，库内角色数据一行不动
+        // （"不用这个角色了"不是"删掉历史"）。
+        run_char(&db, &store, false, true).unwrap();
+        assert!(store.load().unwrap().is_none(), "char --logout 必须清凭据库");
+        assert!(
+            db.char_meta(90_000_001).unwrap().is_some(),
+            "退出登录不得删库内角色数据"
+        );
+
+        // 幂等：本来就没登录时再退一次不该报错（clear 的契约）。
+        run_char(&db, &store, false, true).unwrap();
     }
 }

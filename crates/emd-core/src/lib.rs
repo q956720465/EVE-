@@ -5,6 +5,7 @@
 //!
 //! 设计依据见《EVE 欧服市场客户端-开发方案 v3.1》§3.1、§3.4、§4.1、§5。
 
+pub mod alert;
 pub mod catalog;
 pub mod char;
 pub mod collector;
@@ -18,6 +19,10 @@ pub mod sso;
 pub mod store;
 pub mod tree;
 
+pub use alert::{
+    consumed_lot_costs, detect_buy_trap, detect_expected_sell, detect_realized, order_alert_key,
+    tx_alert_key, AlertKind, AlertPayload, CaliberSummary, NameLookup,
+};
 pub use char::{sync_character, CharSyncReport, JournalEntry, SkillLevel};
 pub use char::fifo::{fifo_costs, CostSource, FifoCost};
 pub use config::EsiConfig;

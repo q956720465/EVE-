@@ -124,6 +124,8 @@ export interface FlipRow {
   vol_source: VolSource;
   buy_levels: number;
   sell_levels: number;
+  /** 跨区行的数据年龄（秒）；null/undefined = 常规枢纽行，数据来自本轮 T1。 */
+  xregion_age_secs?: number | null;
 }
 
 export interface FlipScan {

@@ -310,6 +310,7 @@ const FIX_ROWS: Array<Omit<FlipRow, "net_per_unit" | "net_total" | "margin_pct">
     sell_loc: 60015027, sell_loc_name: "Uitra VI - Moon 4",
     buy_price: 17.04, sell_price: 19.9, qty: 120_000,
     vol24: 44_000_000, vol_source: "history", buy_levels: 37, sell_levels: 9,
+    xregion_age_secs: null,
   },
   {
     type_id: 34, type_name: "Tritanium",
@@ -317,6 +318,7 @@ const FIX_ROWS: Array<Omit<FlipRow, "net_per_unit" | "net_total" | "margin_pct">
     sell_loc: 60015157, sell_loc_name: "Kisogo VII - AIR Laboratories",
     buy_price: 3.94, sell_price: 4.55, qty: 2_000_000,
     vol24: 1_240_000_000, vol_source: "history", buy_levels: 24, sell_levels: 11,
+    xregion_age_secs: null,
   },
   {
     type_id: 88087, type_name: "Eleutrium",
@@ -324,6 +326,16 @@ const FIX_ROWS: Array<Omit<FlipRow, "net_per_unit" | "net_total" | "margin_pct">
     sell_loc: 60015157, sell_loc_name: "Kisogo VII - AIR Laboratories",
     buy_price: 9.85, sell_price: 9.2, qty: 2_100,
     vol24: 2_100, vol_source: "depth", buy_levels: 16, sell_levels: 3,
+    xregion_age_secs: null,
+  },
+  {
+    // 跨区示例：Amarr 站数据来自上一批 T1.5，前端渲染 [跨区 5 分钟前] 角标。
+    type_id: 34, type_name: "Tritanium",
+    buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
+    sell_loc: 60008494, sell_loc_name: "Amarr VIII (Oris) - Emperor Family Academy",
+    buy_price: 3.94, sell_price: 4.28, qty: 380_000,
+    vol24: 1_240_000_000, vol_source: "history", buy_levels: 24, sell_levels: 8,
+    xregion_age_secs: 305,
   },
 ];
 

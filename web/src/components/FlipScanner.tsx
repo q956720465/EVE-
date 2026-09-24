@@ -300,6 +300,14 @@ export default function FlipScanner() {
                   </td>
                   <td className="l">
                     {r.buy_loc_name} → {r.sell_loc_name}
+                    {r.xregion_age_secs != null && (
+                      <span
+                        className="xregion"
+                        title="跨区数据来自上一批 T1.5 采集，最长滞后 12 分钟"
+                      >
+                        跨区 {Math.max(1, Math.round(r.xregion_age_secs / 60))} 分钟前
+                      </span>
+                    )}
                   </td>
                   <td>{fmtPrice(r.buy_price)}</td>
                   <td>{fmtPrice(r.sell_price)}</td>
@@ -332,6 +340,7 @@ export default function FlipScanner() {
       <div className="note">
         净利率 = （卖出净额 − 买入成本 − 运费）÷ 总投入，税基是卖出全额（方案 §4.1 修正口径）；
         数字是估算相对值，不构成"稳赚"承诺。深度只取快照存储的前 5 档。
+        带 <span className="xregion">跨区</span> 角标的行：目标站数据来自上一批 T1.5 采集，最长滞后 12 分钟。
       </div>
     </div>
   );

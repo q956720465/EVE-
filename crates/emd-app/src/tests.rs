@@ -474,3 +474,69 @@ async fn scan_flip_reflects_saved_params_immediately() {
     assert_ne!(before.rows[0].margin_pct, after.rows[0].margin_pct, "保存后重扫数字必须变");
     assert_eq!(after.params, p2, "扫完回显新参数");
 }
+
+#[tokio::test]
+async fn scan_flip_marks_xregion_age_on_rows() {
+    // 跨区数据年龄角标的端到端回归：只要目标站出现在 xregion_books 里，
+    // flip_scan 的对应 row 必须携带 xregion_age_secs=Some(_)——诚实标注"数据来自 T1.5"。
+    let db = Db::in_memory().unwrap();
+    let mk = |loc: u64, asks: &[(f64, u64)], bids: &[(f64, u64)]| emd_core::market::StationOrderBook {
+        location_id: loc,
+        type_id: 34,
+        is_npc_station: true,
+        best_bid: bids.first().map(|&(p, _)| p),
+        bid_qty: bids.first().map(|&(_, v)| v).unwrap_or(0),
+        best_ask: asks.first().map(|&(p, _)| p),
+        ask_qty: asks.first().map(|&(_, v)| v).unwrap_or(0),
+        bid_levels: bids.len() as u32,
+        ask_levels: asks.len() as u32,
+        bid_depth: bids
+            .iter()
+            .map(|&(price, volume)| emd_core::market::PriceLevel { price, volume, orders: 5 })
+            .collect(),
+        ask_depth: asks
+            .iter()
+            .map(|&(price, volume)| emd_core::market::PriceLevel { price, volume, orders: 5 })
+            .collect(),
+        skipped_stale: 0,
+        skipped_thin: 0,
+        skipped_wholesale: 0,
+    };
+    // station_orders 只放 Jita；60008494 (Amarr) 走 xregion_books 的 T1.5 路径。
+    db.write_snapshot(&[mk(emd_core::market::STATION_JITA, &[(100.0, 1000)], &[])], Some("lm"))
+        .unwrap();
+    db.write_hub_pool(&[emd_core::market::Hub {
+        location_id: emd_core::market::STATION_JITA,
+        order_count: 100,
+        share_pct: 50.0,
+        rank: 1,
+    }])
+    .unwrap();
+    db.write_xregion_books(
+        60008494,
+        10000043,
+        &[34],
+        &[mk(60008494, &[], &[(130.0, 1000)])],
+    )
+    .unwrap();
+    let mut p = emd_core::market::FlipParams::default();
+    p.min_batch = 1;
+    p.capital_isk = 1_000_000.0;
+    db.set_flip_params(&p).unwrap();
+    let st = state_with(db, None);
+
+    let out = st.flip_scan().await.unwrap();
+    assert_eq!(out.rows.len(), 1, "Jita→Amarr 唯一对");
+    let row = &out.rows[0];
+    assert_eq!(row.buy_loc, emd_core::market::STATION_JITA);
+    assert_eq!(row.sell_loc, 60008494);
+    assert!(
+        row.xregion_age_secs.is_some(),
+        "卖站在 xregion_books 里 → 必须携带跨区年龄"
+    );
+    assert!(
+        row.xregion_age_secs.unwrap() < 60,
+        "刚写入 → 年龄接近 0，实际值 {:?}",
+        row.xregion_age_secs
+    );
+}

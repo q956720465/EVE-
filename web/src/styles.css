@@ -550,6 +550,20 @@ button:hover {
   padding: 0 4px;
 }
 
+/* M4b：跨区角标。区别于 .vsrc（估算/成交）——用主色提示"这行是跨枢纽补拉数据、有分钟级滞后"，
+   避免用户按同站数据看待。 */
+.xregion {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 4px;
+  opacity: 0.85;
+}
+
 .neg {
   color: var(--ask);
 }

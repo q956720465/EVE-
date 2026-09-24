@@ -77,6 +77,9 @@ pub struct FlipRow {
     pub vol_source: &'static str,
     pub buy_levels: u32,
     pub sell_levels: u32,
+    /// 跨区行数据年龄（秒）；None = 常规枢纽行、数据来自本轮 T1 快照。
+    /// 有值时代表这行的目标站来自 T1.5 补拉，最长可滞后 12 分钟。诚实标注。
+    pub xregion_age_secs: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -182,7 +185,9 @@ impl AppState {
     async fn flip_scan(&self) -> Result<FlipScanOut, String> {
         read(self.db.clone(), |db| {
             let books = db.load_books().map_err(err)?;
-            let hubs = db.hub_pool().map_err(err)?;
+            let hubs = db.flip_hubs().map_err(err)?;
+            let ages = db.xregion_ages().map_err(err)?;
+            let now = emd_core::store::now_unix();
             let vol = db.latest_vol24().map_err(err)?;
             let params = db.get_flip_params().map_err(err)?;
             let age = db.last_round_age_secs().map_err(err)?;
@@ -201,6 +206,12 @@ impl AppState {
                     .station_name(o.sell_loc)
                     .map_err(err)?
                     .unwrap_or_else(|| format!("站点 #{}", o.sell_loc));
+                // 两站任一在 xregion_ages 里 = 跨区行；取"最老"那份时间戳（=min）算年龄。
+                let xregion_age_secs = [o.buy_loc, o.sell_loc]
+                    .iter()
+                    .filter_map(|l| ages.get(l).copied())
+                    .min()
+                    .map(|ts| (now - ts).max(0));
                 rows.push(FlipRow {
                     type_id: o.type_id,
                     type_name,
@@ -221,6 +232,7 @@ impl AppState {
                     },
                     buy_levels: o.buy_levels,
                     sell_levels: o.sell_levels,
+                    xregion_age_secs,
                 });
             }
             Ok(FlipScanOut {

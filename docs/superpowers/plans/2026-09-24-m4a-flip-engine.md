@@ -502,7 +502,7 @@ fn flip_params_roundtrip_and_scan_shape() { /* set→get 相等；scan_flip 返�
 **R1–R8 裁决执行情况**：
 - R1 基率 7.5/3.0：落地于 `FeeModel::default`，A0/B0 真机 0 机会正是该裁决预期的"真实成本"。
 - R2 地板 min(1%, 基率)：`effective_broker` 实现，单测覆盖基率<1.5% 边界。
-- R3 单件 ISK 运费：参数与扫描均按 `freight_isk_per_unit`；m3×跳数口径**挂账至 M4b**。
+- R3 单件 ISK 运费：参数与扫描均按 `freight_isk_per_unit`；m3×跳数按 spec §1 保持挂账——**不属 M4b 既定范围**（M4b = T1.5 + 状态机 + 迁移 v5），无跳数来源时 m3 模型不可算。
 - R4 预算 best_ask 估算不回退：`scan` 内一次定 budget_qty，无重算循环。
 - R5 vol24 回落 Depth 带角标：表格"成交/估算"角标已实现。
 - R6 试算 Rust 单源：`trial_calc` 命令；fixture 镜像显式标注"漂移以 Rust 为准"（`d964500`）。
@@ -512,4 +512,12 @@ fn flip_params_roundtrip_and_scan_shape() { /* set→get 相等；scan_flip 返�
 **挂账项**：
 1. `web/index.html` 引 `/favicon.ico` 但 `web/public/` 缺失，dev 控制台 404（不影响构建与功能）。
 2. vite 产物 >500kB 单 chunk 警告（图表库未分包），留待性能里程碑处理。
-3. R3 的 m3×跳数运费口径 → M4b。
+3. R3 的 m3×跳数运费口径：保持挂账（待星图路由数据源；非 M4b 范围）。
+
+---
+
+## 挂账项收口（2026-09-24 追加）
+
+1. **favicon 404 → 已修**：补 `web/public/favicon.ico`（复用 `emd-app/icons/icon.ico`；Vite dev 直接服务 public 根，dev/build 两态零 404）。
+2. **chunk 警告 → 已修**：vite `manualChunks` 按包拆分（echarts 369kB / zrender 177kB / react-vendor 144kB / virtual 26kB / app 29kB），HistoryChart 改 `React.lazy`+`Suspense`——echarts+zrender 仅点开「历史」时加载；首屏 js 从 747kB 降至 ~173kB，构建无 >500kB 警告。
+3. **R3 m3×跳数 → 记录归位（本项不可即修，非代码遗留）**：spec 已裁决「无跳数来源时 m3 模型不可算」；本地库无 station→system 路由与类型 m3，故不属 M4a/M4b 范围。收口条件：引入星图路由数据源后，scan 以入参注入 volume/jumps 保持纯函数（同 vol24 模式）；ESI 侧需新增 `/universe/types/{id}`（volume）与 `/route/{o}/{d}/`（跳数）并过 M0.5 合规闸门。

@@ -1,8 +1,11 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { useStore } from "../store";
 import { ageOf, fmtPrice, fmtVol } from "../format";
-import HistoryChart from "./HistoryChart";
 import type { PriceLevel } from "../types";
+
+// echarts 只在切到「历史」时才需要：懒加载把它从首屏包里拆出去，
+// 顺手让历史页第一次渲染多一帧“读取历史…”的诚实等待。
+const HistoryChart = lazy(() => import("./HistoryChart"));
 
 function Ladder({ side, levels }: { side: "ask" | "bid"; levels: PriceLevel[] }) {
   // 用户指定：不要图形表达（深度条已去），只留数字；颜色仍标买/卖。
@@ -72,7 +75,9 @@ export default function OrderBook() {
       {!selected ? (
         <div className="empty">从中间列表选一个类型。</div>
       ) : view === "hist" ? (
-        <HistoryChart typeId={selected} />
+        <Suspense fallback={<div className="empty">读取历史…</div>}>
+          <HistoryChart typeId={selected} />
+        </Suspense>
       ) : !detail ? (
         // 区分"还在读"与"真没有盘"：无快照行的类型 book_row 返回 null，
         // 以前永远显示"读取中…"，用户会盯着一个永远不会来的加载转圈（走查 #10/#16）。

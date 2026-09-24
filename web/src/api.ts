@@ -1,10 +1,12 @@
-import type { AppStatus, FlipParams, FlipRow, FlipScan, HistoryBar, Hub, ListingRow, TrialOut, TreeGroup, TreeNode, TypeDetail } from "./types";
+import type { AppStatus, FeeModel, FlipParams, FlipRow, FlipScan, HistoryBar, Hub, ListingRow, TrialOut, TreeGroup, TreeNode, TypeDetail } from "./types";
 
 /**
  * 与 Rust 后端的唯一边界。
  *
  * 浏览器里直接 `npm run dev`（没有 Tauri 壳）时走 `fixtures`，只为看布局与联调交互；
  * 一旦运行在 WebView2 里就一定走真实 IPC —— 两者不能混，否则会把假数据当行情看。
+ * fixture 里的费率重算（spec §3.3"参数/技能改动在 fixture 下本地重算"）是 Rust
+ * 公式的走查镜像：锚点对齐 emd-core::market::flip 的单测，漂移时以 Rust 为准。
  */
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -86,16 +88,22 @@ export const api = {
 
   async setFlipParams(params: FlipParams): Promise<void> {
     if (!inTauri) {
-      // 预览模式只存面板回显；行数据是演示常数，不重算（见 fixFlip 注释）。
+      // 预览没有可落的库：参数存进内存，保存后的 loadFlip 随即用下面的镜像重算
+      // （不是"只回显"——spec §3.3 要求 fixture 下参数/技能改动本地重算）。
       fixFlipParams = params;
       return;
     }
     await call("set_flip_params", { params });
   },
 
-  /** 单笔试算：费率公式只有 Rust 一份（spec R6），这里不复制。 */
+  /** 单笔试算：生产入口的费率公式只有 Rust 一份（spec R6）；预览走 fixture 镜像。 */
   async trialCalc(buyPrice: number, sellPrice: number, qty: number): Promise<TrialOut> {
-    if (!inTauri) return fixTrial();
+    if (!inTauri) {
+      // 与 Rust 命令层同一防护口径：坏输入直接报错，不渲染成"绿色 0 收益"。
+      if (!(qty > 0)) throw new Error("数量必须大于 0");
+      if (!(buyPrice > 0) || !(sellPrice > 0)) throw new Error("买价/卖价必须是大于 0 的数字");
+      return fixSettle(buyPrice, sellPrice, qty);
+    }
     return call<TrialOut>("trial_calc", { buyPrice, sellPrice, qty });
   },
 };
@@ -247,9 +255,10 @@ function fixHubs(): Hub[] {
 }
 
 // ---- M4a 倒卖引擎的演示数据 ------------------------------------------------
-// 关键口径：fixture 行是**演示常数**，不复刻费率公式（spec R6 单一出口在
-// Rust 侧）。技能步进器在预览模式只回显参数与角标，真实数值变化由 daemon
-// 真机对比与 cargo 单测验证。
+// 预览按 spec §3.3 做本地重算：参数/技能改动保存后，fixFlip/试算立即用下面的
+// 费率镜像重算，角标与行列数字随新参数变化。公式单源仍在 Rust（spec R6）；
+// 镜像锚点对齐 emd-core::market::flip 的单测（7.5%/0 技能 → 0.075；BR 每级
+// −0.3pp、地板 min(1%, 基率)），若两边漂移，以 Rust 侧为准。
 let fixFlipParams: FlipParams = {
   fees: { sales_tax_pct: 7.5, broker_pct: 3.0, accounting: 0, broker_relations: 0, faction_standing: 0, corp_standing: 0 },
   margin_threshold_pct: 3.0,
@@ -260,33 +269,69 @@ let fixFlipParams: FlipParams = {
   include_buy_broker: false,
 };
 
+/** FeeModel::effective_sales_tax 的镜像：Accounting 每级相对 −11%，下界 0。 */
+const fixEffectiveTax = (f: FeeModel): number =>
+  Math.max((f.sales_tax_pct / 100) * (1 - 0.11 * Math.min(Math.max(f.accounting, 0), 5)), 0);
+
+/** FeeModel::effective_broker 的镜像：每级绝对 −0.3pp；地板 min(1%, 基率)。 */
+const fixEffectiveBroker = (f: FeeModel): number => {
+  const base = f.broker_pct / 100;
+  const floor = Math.min(base, 0.01);
+  return Math.max(
+    base -
+      0.003 * Math.min(Math.max(f.broker_relations, 0), 5) -
+      0.0003 * Math.max(f.faction_standing, 0) -
+      0.0002 * Math.max(f.corp_standing, 0),
+    floor,
+  );
+};
+
+/** flip::settle 的镜像：税基是卖出全额；预览里机会行与试算共用这一份。 */
+function fixSettle(buy: number, sell: number, qty: number): TrialOut {
+  const broker = fixEffectiveBroker(fixFlipParams.fees);
+  const tax = fixEffectiveTax(fixFlipParams.fees);
+  const netSell = sell * qty * (1 - broker - tax);
+  let cost = buy * qty + fixFlipParams.freight_isk_per_unit * qty;
+  if (fixFlipParams.include_buy_broker) cost += buy * qty * broker;
+  if (cost <= 0) return { net_per_unit: 0, net_total: 0, margin_pct: 0 };
+  const net = netSell - cost;
+  return { net_per_unit: net / qty, net_total: net, margin_pct: (net / cost) * 100 };
+}
+
+/**
+ * 演示快照：只有价/量是冻着的常数（模拟一份采集结果），净利数字一律现算。
+ * 固定 3 行、不模拟引擎的机会筛选（min_batch/资金/阈值）——预览看的是
+ * "改参数 → 角标与数字即时变化"；筛选行为以真机为准。
+ */
+const FIX_ROWS: Array<Omit<FlipRow, "net_per_unit" | "net_total" | "margin_pct">> = [
+  {
+    type_id: 36, type_name: "Isogen",
+    buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
+    sell_loc: 60015027, sell_loc_name: "Uitra VI - Moon 4",
+    buy_price: 17.04, sell_price: 19.9, qty: 120_000,
+    vol24: 44_000_000, vol_source: "history", buy_levels: 37, sell_levels: 9,
+  },
+  {
+    type_id: 34, type_name: "Tritanium",
+    buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
+    sell_loc: 60015157, sell_loc_name: "Kisogo VII - AIR Laboratories",
+    buy_price: 3.94, sell_price: 4.55, qty: 2_000_000,
+    vol24: 1_240_000_000, vol_source: "history", buy_levels: 24, sell_levels: 11,
+  },
+  {
+    type_id: 88087, type_name: "Eleutrium",
+    buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
+    sell_loc: 60015157, sell_loc_name: "Kisogo VII - AIR Laboratories",
+    buy_price: 9.85, sell_price: 9.2, qty: 2_100,
+    vol24: 2_100, vol_source: "depth", buy_levels: 16, sell_levels: 3,
+  },
+];
+
 function fixFlip(): FlipScan {
-  const rows: FlipRow[] = [
-    {
-      type_id: 36, type_name: "Isogen",
-      buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
-      sell_loc: 60015027, sell_loc_name: "Uitra VI - Moon 4",
-      buy_price: 17.04, sell_price: 19.9, qty: 120_000,
-      net_per_unit: 1.42, net_total: 170_400, margin_pct: 8.33,
-      vol24: 44_000_000, vol_source: "history", buy_levels: 37, sell_levels: 9,
-    },
-    {
-      type_id: 34, type_name: "Tritanium",
-      buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
-      sell_loc: 60015157, sell_loc_name: "Kisogo VII - AIR Laboratories",
-      buy_price: 3.94, sell_price: 4.55, qty: 2_000_000,
-      net_per_unit: 0.131, net_total: 262_000, margin_pct: 3.32,
-      vol24: 1_240_000_000, vol_source: "history", buy_levels: 24, sell_levels: 11,
-    },
-    {
-      type_id: 88087, type_name: "Eleutrium",
-      buy_loc: 60003760, buy_loc_name: "Jita IV - Moon 4",
-      sell_loc: 60015157, sell_loc_name: "Kisogo VII - AIR Laboratories",
-      buy_price: 9.85, sell_price: 9.2, qty: 2_100,
-      net_per_unit: -1.55, net_total: -3_255, margin_pct: -15.7,
-      vol24: 2_100, vol_source: "depth", buy_levels: 16, sell_levels: 3,
-    },
-  ];
+  const rows: FlipRow[] = FIX_ROWS.map((r) => ({
+    ...r,
+    ...fixSettle(r.buy_price, r.sell_price, r.qty),
+  }));
   return {
     rows,
     pairs_evaluated: 268,
@@ -295,12 +340,7 @@ function fixFlip(): FlipScan {
     dropped_threshold: 34,
     age_secs: 95,
     params: fixFlipParams,
-    effective_sales_tax_pct: 7.5,
-    effective_broker_pct: 3.0,
+    effective_sales_tax_pct: fixEffectiveTax(fixFlipParams.fees) * 100,
+    effective_broker_pct: fixEffectiveBroker(fixFlipParams.fees) * 100,
   };
-}
-
-function fixTrial(): TrialOut {
-  // 演示回答：负数演示"默认口径扣税后亏损"这条 UI 告警；不跑公式（见上）。
-  return { net_per_unit: -1.55, net_total: -15.5, margin_pct: -1.55 };
 }

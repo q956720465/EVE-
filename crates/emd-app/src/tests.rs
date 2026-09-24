@@ -371,8 +371,8 @@ async fn trial_is_negative_by_default_and_positive_with_max_skills() {
     assert!(st.trial(-1.0, 110.0, 10).await.is_err());
 }
 
-#[tokio::test]
-async fn scan_flip_assembles_engine_output_with_names() {
+/// 倒卖链路的最小库：类型 34 的两站单簿（Jita 卖 100 / 站 60015157 买 130）+ 枢纽池。
+fn flip_engine_db() -> Db {
     let db = Db::in_memory().unwrap();
     let mk = |loc: u64, asks: &[(f64, u64)], bids: &[(f64, u64)]| emd_core::market::StationOrderBook {
         location_id: loc,
@@ -410,6 +410,12 @@ async fn scan_flip_assembles_engine_output_with_names() {
     ])
     .unwrap();
     db.name_station(60015157, "Kisogo VII – AIR Laboratories", None).unwrap();
+    db
+}
+
+#[tokio::test]
+async fn scan_flip_assembles_engine_output_with_names() {
+    let db = flip_engine_db();
     // 不绕过持久化校验：用默认 3% 阈值 + 真实盈利对
     // （130×0.895 − 100 = 16.35/件），而不是负阈值（那会被且有理由被拒绝写入）。
     let mut p = emd_core::market::FlipParams::default();
@@ -435,4 +441,36 @@ async fn scan_flip_assembles_engine_output_with_names() {
     assert_eq!(out.pairs_evaluated, 1);
     assert_eq!(out.age_secs, None, "没有 round_log → 面板显示先跑采集");
     assert_eq!(out.params, p, "扫完回显当前参数，面板无需再拉");
+}
+
+#[tokio::test]
+async fn scan_flip_reflects_saved_params_immediately() {
+    // 用户报告链路的回归：改参数 → 保存(set_flip_params) → 立即重扫(scan_flip)，
+    // 生效税率与净利/净利率必须随新参数走（不随动 = 保存被吞 / 重扫没读新参数）。
+    let db = flip_engine_db();
+    let mut p = emd_core::market::FlipParams::default();
+    p.min_batch = 1;
+    p.capital_isk = 1_000_000.0;
+    db.set_flip_params(&p).unwrap();
+    let st = state_with(db, None);
+
+    let before = st.flip_scan().await.unwrap();
+    assert!((before.effective_sales_tax_pct - 7.5).abs() < 1e-9);
+    assert!((before.effective_broker_pct - 3.0).abs() < 1e-9);
+    assert!((before.rows[0].margin_pct - 16.35).abs() < 1e-9, "130×0.895 − 100");
+
+    // 保存"销售税基 5.0 + 满技能"：税 2.25% / 中介 1.5% / margin 25.125%。
+    let mut p2 = p.clone();
+    p2.fees.sales_tax_pct = 5.0;
+    p2.fees.accounting = 5;
+    p2.fees.broker_relations = 5;
+    st.flip_save(p2.clone()).await.unwrap();
+
+    let after = st.flip_scan().await.unwrap();
+    assert!((after.effective_sales_tax_pct - 2.25).abs() < 1e-9, "5.0 × (1−0.11×5)");
+    assert!((after.effective_broker_pct - 1.5).abs() < 1e-9, "3.0 − 0.3pp×5");
+    assert!((after.rows[0].margin_pct - 25.125).abs() < 1e-9, "130×0.9625 − 100");
+    assert!((after.rows[0].net_total - 12_562.5).abs() < 1e-9, "25.125 × 500");
+    assert_ne!(before.rows[0].margin_pct, after.rows[0].margin_pct, "保存后重扫数字必须变");
+    assert_eq!(after.params, p2, "扫完回显新参数");
 }

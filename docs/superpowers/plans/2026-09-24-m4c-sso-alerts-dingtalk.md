@@ -880,7 +880,7 @@ git commit -m "feat(core): 钉钉加签与 markdown 私有卡片（渲染与错�
 
 **Interfaces:**
 - Consumes: `push::dingtalk::*`、`store::char_db::save_alert`
-- Produces: `PushOutcome`、`trait PushChannel`、`LocalChannel`、`DingTalkChannel::new(webhook, secret)`、`dispatch(channels, payload) -> Vec<PushOutcome>`、`PushConfig`（webhook/secret/enabled，读 `meta` KV 不建表）
+- Produces: `PushOutcome`、`trait PushChannel`、`LocalChannel`、`DingTalkChannel::new(webhook, secret)`、`dispatch(channels, payload) -> Vec<PushOutcome>`、`mask(&str) -> String`（webhook token / secret / access_token 一律中段打码，日志与 UI 回显都走它）、`PushConfig`（webhook/secret/enabled，读 `meta` KV 不建表）
 
 - [ ] **Step 1: 写失败测试**
 

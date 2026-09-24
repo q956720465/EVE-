@@ -452,6 +452,101 @@ git commit -m "feat(core): 令牌存储抽象（keyring/内存双实现，凭据
 
 ---
 
+### Task 3B: `sso/flow.rs` — SSO 登录编排（loopback + 浏览器 + 令牌交换）
+
+> **插入说明（控制器裁决）：** 原计划的「文件结构」节列出了 `src/sso/flow.rs`，但 15 个 Task 里没有任何一个拥有它——登录流程（起 loopback、开浏览器、换令牌、落 keyring）成了无主代码。这是计划缺口，不是可选项：没有它，T13/T14 的登录入口无处可调。原 Task 4-15 编号不变。
+
+**Files:**
+- Create: `crates/emd-core/src/sso/flow.rs`
+- Create: `crates/emd-core/src/sso/listen.rs`
+- Modify: `crates/emd-core/src/sso.rs`（`pub mod flow; pub mod listen;`）、`crates/emd-core/Cargo.toml`（加 `tiny_http`）
+
+**Interfaces:**
+- Consumes: `Pkce`/`authorize_url`/`verify_callback`（T1）、`exchange_body`/`parse_token_response`/`TokenSet`（T2）、`TokenStore`（T3）
+- Produces: `LoginOutcome { char_id: u64, name: String }`、`char_from_access_token(jwt) -> Result<(u64, String)>`（纯函数）、`CallbackListener::bind(port) -> Result<Self>`、`CallbackListener::wait_for_code(timeout, expected_state) -> Result<String>`、`login(cfg, store) -> Result<LoginOutcome>`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+/// JWT 的 sub 形如 "CHARACTER:EVE:2112625428"，name 是角色名。
+/// 用合成的 JWT（只有 payload 段是真 base64url）测纯解析，不打网络。
+#[test]
+fn char_from_access_token_reads_sub_and_name() {
+    let payload = r#"{"sub":"CHARACTER:EVE:2112625428","name":"Test Pilot","exp":1}"#;
+    let jwt = format!("eyJhbGciOiJub25lIn0.{}.sig", b64url(payload.as_bytes()));
+    let (id, name) = char_from_access_token(&jwt).unwrap();
+    assert_eq!(id, 2_112_625_428);
+    assert_eq!(name, "Test Pilot");
+}
+
+#[test]
+fn char_from_access_token_rejects_non_character_subject() {
+    // sub 不是 CHARACTER:EVE:<数字> 时必须报错，不能瞎猜一个 id 出来
+    let payload = r#"{"sub":"USER:123","name":"x"}"#;
+    let jwt = format!("eyJhbGciOiJub25lIn0.{}.sig", b64url(payload.as_bytes()));
+    assert!(char_from_access_token(&jwt).is_err());
+    assert!(char_from_access_token("not-a-jwt").is_err());
+    assert!(char_from_access_token("a.b").is_err());
+}
+
+/// loopback 监听器：真起一个本地端口，自己发一个 GET 过去，断言能捞出 code。
+/// 用 0 端口让 OS 分配，避免测试间抢端口。
+#[test]
+fn listener_extracts_code_from_a_real_local_request() {
+    let l = CallbackListener::bind(0).unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        // 用裸 TcpStream 发一个最小 HTTP GET，避免为测试再引 HTTP 客户端
+        use std::io::Write;
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let _ = s.write_all(b"GET /callback?code=THE_CODE&state=ST HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    });
+    let code = l.wait_for_code(std::time::Duration::from_secs(5), "ST").unwrap();
+    assert_eq!(code, "THE_CODE");
+}
+
+#[test]
+fn listener_rejects_wrong_state() {
+    let l = CallbackListener::bind(0).unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let _ = s.write_all(b"GET /callback?code=C&state=EVIL HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    });
+    assert!(l.wait_for_code(std::time::Duration::from_secs(5), "ST").is_err());
+}
+
+#[test]
+fn listener_times_out_when_nobody_calls_back() {
+    let l = CallbackListener::bind(0).unwrap();
+    let e = l.wait_for_code(std::time::Duration::from_millis(200), "ST").unwrap_err();
+    assert!(e.to_string().contains("超时"), "{e}");
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败** → `cargo test -p emd-core sso::flow` 编译失败
+
+- [ ] **Step 3: 实现**
+
+要点与必须遵守的纪律：
+1. **令牌端点在 `login.eveonline.com`，不是 ESI 的 `esi.evetech.net`** —— 所以**不能**用 `EsiClient`（它的 `absolutize` 会拼到 ESI base_url）。本文件自带一个短超时的 reqwest 调用（登录是用户手点的一次性动作，1-2 个请求，不进 ESI 的预算/节流体系）。
+2. **`login` 是唯一会开浏览器与阻塞等待的函数**。开浏览器用 `std::process::Command::new("cmd").args(["/C","start","",url])`（项目只做 Windows，不引 opener 依赖）。
+3. **超时必设**：默认 180 s。用户不完成登录时 `login` 返回超时错误，**不留下已绑定端口**（`CallbackListener` 用 `Drop` 或显式关闭保证）。
+4. **state 校验走 `verify_callback`**（T1 的纯函数），本文件不重复实现。
+5. **令牌只进 `TokenStore`**，本文件不写任何 DB、不 `tracing` 打印 `TokenSet` 或 `jwt` 原文（Global Constraints 的脱敏要求）。
+
+- [ ] **Step 4: 跑测试确认通过**
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add Cargo.toml crates/emd-core/Cargo.toml crates/emd-core/src/sso.rs crates/emd-core/src/sso/flow.rs crates/emd-core/src/sso/listen.rs
+git commit -m "feat(core): SSO 登录编排（loopback 监听/JWT 角色解析/浏览器跳转/令牌落 keyring，自带短超时 HTTP）"
+```
+
+---
+
 ### Task 4: `esi/client.rs` — Bearer 注入
 
 **Files:** Modify: `crates/emd-core/src/esi/client.rs`

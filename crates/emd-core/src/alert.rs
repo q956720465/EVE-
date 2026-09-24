@@ -51,7 +51,7 @@ mod state;
 /// 判定（本文件上半）与状态机（[`state`]）分开：判定只管"这一轮亏没亏"，
 /// 状态机管"该不该推、推过几次"。
 pub use state::{
-    can_push, day_entries_used, mark_pushed, tick_alert, AlertRecord, AlertState,
+    can_push, can_push_in, day_entries_used, mark_pushed, tick_alert, AlertRecord, AlertState,
     ALERT_COOLDOWN_SECS, ALERT_DAILY_CAP, ALERT_DEEPEN_PP,
 };
 

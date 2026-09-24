@@ -3,6 +3,8 @@ resolver = "2"
 members = ["crates/emd-core", "crates/emd-daemon", "crates/emd-app"]
 # Tauri 壳带两百多个依赖，全量 `cargo build` 会把它一起拖慢。
 # 需要它时用 `cargo build -p emd-app` 或 `cargo tauri dev`。
+# 注意：默认 `cargo test` 会静默跳过 emd-app 的测试，验证一律用
+# `cargo test -p emd-core -p emd-daemon -p emd-app`（见 AGENTS.md）。
 default-members = ["crates/emd-core", "crates/emd-daemon"]
 
 [workspace.package]

@@ -668,16 +668,21 @@ impl Db {
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)? as u32,
                 r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
             ))
         })?;
+        let rows: Vec<_> = rows.collect::<std::result::Result<_, _>>()?;
+
+        // 计数只数 inv_types 里真正解出名字的类型 —— 和 group_listing 的
+        // FROM inv_types 同一张表，树上写的和列表摆出来的天生一致。
+        let mut counter = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM inv_types WHERE group_id = ?1")?;
 
         let mut out: Vec<TreeNode> = Vec::new();
-        for row in rows.flatten() {
-            let (cat_id, cat_name, gid, gname, types_json) = row;
-            let count: usize = serde_json::from_str::<Vec<u32>>(&types_json)
-                .map(|v| v.len())
-                .unwrap_or(0);
+        for (cat_id, cat_name, gid, gname) in rows {
+            let count: usize = counter
+                .query_row(params![gid as i64], |r| r.get::<_, i64>(0))
+                .unwrap_or(0) as usize;
             match out.iter_mut().find(|t| t.category_id == cat_id) {
                 Some(t) => t.groups.push(TreeGroup {
                     group_id: gid,
@@ -1484,7 +1489,7 @@ mod tests {
                 category_id: 10,
                 name: Some("Noble Metals".into()),
                 published: true,
-                types: vec![34, 35],
+                types: vec![34, 35, 44_707],
             },
             crate::tree::GroupDetail {
                 group_id: 10,
@@ -1523,7 +1528,15 @@ mod tests {
         assert_eq!(tree[0].name, "Trading", "分类名取自 inv_categories");
         assert_eq!(tree[0].groups.len(), 1);
         assert_eq!(tree[0].groups[0].name, "Noble Metals");
+        // 树里的计数必须等于列表真正能摆出来的行数：组 JSON 里那个没解出名字的
+        // 44707 不在 inv_types，列表不会有它 —— 拿 types.len() 充数会让
+        // "Noble Metals 3" 和"2 个类型"同屏矛盾（走查抓到过）。
         assert_eq!(tree[0].groups[0].type_count, 2);
+        assert_eq!(
+            tree[0].groups[0].type_count,
+            db.group_listing(18, STATION_JITA).unwrap().len(),
+            "树上写的数 = 点进去能看到的行数，两处口径不能打架"
+        );
 
         // 列表页要把吉他当前价并上来。
         db.write_snapshot(&sample_books(), Some("lm")).unwrap();

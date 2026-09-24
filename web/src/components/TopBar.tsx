@@ -29,7 +29,10 @@ export default function TopBar() {
 
   return (
     <div className="topbar">
-      <div className="ring" title={`本轮采集耗时 ${(status?.last_seconds ?? 0).toFixed(1)}s，其余在等缓存过期`}>
+      <div
+        className="ring"
+        title={`弧长 = 距下次采集的剩余占比（满环=刚发布，空环=到点）。本轮采集耗时 ${(status?.last_seconds ?? 0).toFixed(1)}s，其余在等缓存过期`}
+      >
         <svg width="36" height="36" viewBox="0 0 36 36">
           <circle cx="18" cy="18" r={R} fill="none" stroke="var(--line)" strokeWidth="3" />
           <circle
@@ -69,6 +72,7 @@ export default function TopBar() {
 
       <input
         className="search"
+        aria-label="搜索物品类型"
         placeholder="搜索类型名（≥2 字，走 universe/ids + 本地别名）"
         value={word}
         onChange={(e) => {

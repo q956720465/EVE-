@@ -13,6 +13,8 @@ export default function App() {
   const error = useStore((s) => s.error);
   const status = useStore((s) => s.status);
   const rows = useStore((s) => s.rows);
+  const query = useStore((s) => s.query);
+  const searchResults = useStore((s) => s.searchResults);
   const groupName = useStore((s) => s.groupName);
 
   useEffect(() => {
@@ -50,7 +52,12 @@ export default function App() {
           </>
         )}
         <span className="grow" />
-        <span>{rows.length.toLocaleString()} 行 · {groupName}</span>
+        {/* 搜索态下中栏摆的是搜索结果，状态栏却还报上一组的行数——两处口径打架（走查 #14）。 */}
+        {query.trim().length >= 2 ? (
+          <span>{searchResults.length} 行 · 搜索中</span>
+        ) : (
+          <span>{rows.length.toLocaleString()} 行 · {groupName}</span>
+        )}
       </div>
     </div>
   );

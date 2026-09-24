@@ -16,6 +16,8 @@ interface State {
   rows: ListingRow[];
   selected: number | null;
   detail: TypeDetail | null;
+  /** detail 对应哪个 type。null 详情 + 匹配 id = "真没有盘"，不匹配 = 还在读。 */
+  detailFor: number | null;
   query: string;
   searchResults: ListingRow[];
   busy: boolean;
@@ -41,6 +43,7 @@ export const useStore = create<State>((set, get) => ({
   rows: [],
   selected: null,
   detail: null,
+  detailFor: null,
   query: "",
   searchResults: [],
   busy: false,
@@ -66,12 +69,18 @@ export const useStore = create<State>((set, get) => ({
   },
 
   toggle(categoryId) {
-    const cur = get().expanded[categoryId] ?? true;
+    // 默认值必须和 CatalogTree 的 `?? false` 同一口径：之前这里缺省当"已展开"，
+    // selectGroup 的首次自动 toggle 反而把分类写成收起（复验 F：首屏全收起）。
+    const cur = get().expanded[categoryId] ?? false;
     set({ expanded: { ...get().expanded, [categoryId]: !cur } });
   },
 
   async selectGroup(groupId, name) {
-    set({ groupId, groupName: name, rows: [], selected: null, detail: null, query: "", searchResults: [] });
+    set({ groupId, groupName: name, rows: [], selected: null, detail: null, detailFor: null, query: "", searchResults: [] });
+    // 选中哪个组，它所属的分类就自动展开 —— 否则首屏列表已经摆出来了，
+    // 左栏三棵树还全是收起的，看不出当前视图挂在哪里（走查 #7）。
+    const cat = get().tree.find((t) => t.groups.some((g) => g.group_id === groupId));
+    if (cat && !get().expanded[cat.category_id]) get().toggle(cat.category_id);
     try {
       const rows = await api.listing(groupId, get().locationId);
       set({ rows });
@@ -88,7 +97,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   async selectType(typeId) {
-    set({ selected: typeId, detail: null });
+    set({ selected: typeId, detail: null, detailFor: typeId });
     try {
       const detail = await api.detail(typeId, get().locationId);
       set({ detail });

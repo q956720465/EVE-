@@ -114,7 +114,11 @@ function fixListing(groupId: number): ListingRow[] {
     [88087, "Eleutrium", 5.03, 8_800_000, 9.85, 2_100_000, 9, 16],
     [27029, "Chalcopyrite", null, 0, null, 0, 0, 0],
   ];
-  const rows = groupId === 0 ? base.slice(0, 4) : base;
+  // 按组轮转入参行：切组时列表真的一模一样，走查时根本看不出"刷新没生效"。
+  // 用 groupId 做旋转量，假数据至少能分辨"换组 → 换行"这条链路。
+  const off = groupId % base.length;
+  const rotated = base.map((_, i) => base[(i + off) % base.length]!);
+  const rows = groupId === 0 ? base.slice(0, 4) : rotated;
   return rows.map(([type_id, name, best_bid, bid_qty, best_ask, ask_qty, bl, al]) => ({
     type_id,
     name,
@@ -128,32 +132,45 @@ function fixListing(groupId: number): ListingRow[] {
 }
 
 function fixDetail(typeId: number): TypeDetail {
+  // fixture 也得尊重"零挂单类型没有盘"：以前任何 typeId 都回 Tritanium 的满档，
+  // 把"选中 Chalcopyrite 右栏却挂着满阶梯"的渲染未刷新疑云永久掩盖了。
+  const empty = typeId === 27029 || typeId === 40;
+  const row = fixListing(18).find((r) => r.type_id === typeId);
   return {
     type_id: typeId,
-    name: fixListing(18).find((r) => r.type_id === typeId)?.name ?? "未知类型",
+    name: row?.name ?? "未知类型",
     location_id: 60003760,
     location_name: "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
-    bid_depth: [
-      { price: 3.8, volume: 12_400_000, orders: 4 },
-      { price: 3.79, volume: 8_100_000, orders: 7 },
-      { price: 3.78, volume: 5_200_000, orders: 3 },
-    ],
-    ask_depth: [
-      { price: 3.94, volume: 9_800_000, orders: 6 },
-      { price: 3.95, volume: 14_200_000, orders: 11 },
-      { price: 3.96, volume: 3_100_000, orders: 2 },
-    ],
-    bid_levels: 30,
-    ask_levels: 24,
-    skipped_stale: 12,
-    skipped_thin: 41,
+    bid_depth: empty
+      ? []
+      : [
+          { price: 3.8, volume: 12_400_000, orders: 4 },
+          { price: 3.79, volume: 8_100_000, orders: 7 },
+          { price: 3.78, volume: 5_200_000, orders: 3 },
+        ],
+    ask_depth: empty
+      ? []
+      : [
+          { price: 3.94, volume: 9_800_000, orders: 6 },
+          { price: 3.95, volume: 14_200_000, orders: 11 },
+          { price: 3.96, volume: 3_100_000, orders: 2 },
+        ],
+    bid_levels: empty ? 0 : 30,
+    ask_levels: empty ? 0 : 24,
+    skipped_stale: empty ? 0 : 12,
+    skipped_thin: empty ? 0 : 41,
     skipped_wholesale: 0,
     snapshot_lm: "Wed, 23 Sep 2026 15:37:42 GMT",
     updated_at: Math.floor(Date.now() / 1000) - 90,
   };
 }
 
+const FIX_T0 = Date.now();
+
 function fixStatus(): AppStatus {
+  // 倒计时必须是动态的：常数 243s 让"冻结的环"看起来像真 bug（走查 #13 即此）。
+  // 按页龄回落到 6 分钟循环，和真采集者的节拍同形。
+  const leftMs = 360_000 - ((Date.now() - FIX_T0) % 360_000);
   return {
     round: 12,
     stage: "WaitingNext",
@@ -161,7 +178,7 @@ function fixStatus(): AppStatus {
     orders: 408_739,
     rows_written: 16_686,
     hubs: 20,
-    next_in_ms: 243_000,
+    next_in_ms: leftMs,
     snapshot_lm: "Wed, 23 Sep 2026 15:37:42 GMT",
     remaining_tokens: 9_481,
     jita_rows: 13_463,

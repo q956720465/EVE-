@@ -4,15 +4,13 @@ import { ageOf, fmtPrice, fmtVol } from "../format";
 import HistoryChart from "./HistoryChart";
 import type { PriceLevel } from "../types";
 
-const COLS = { display: "grid", gridTemplateColumns: "1fr auto auto auto", gap: "0 10px" } as const;
-
 function Ladder({ side, levels }: { side: "ask" | "bid"; levels: PriceLevel[] }) {
   const max = Math.max(1, ...levels.map((l) => l.volume));
   const color = side === "ask" ? "var(--ask)" : "var(--bid)";
   return (
-    <div>
-      <div style={COLS} className="h">
-        <span>{side === "ask" ? "价格" : "价格"}</span>
+    <div className={`ladder ${side}`}>
+      <div className="h">
+        <span>价格</span>
         <span>数量</span>
         <span>累计</span>
         <span>笔</span>
@@ -20,10 +18,12 @@ function Ladder({ side, levels }: { side: "ask" | "bid"; levels: PriceLevel[] })
       {levels.map((l, i) => {
         const cum = levels.slice(0, i + 1).reduce((a, b) => a + b.volume, 0);
         return (
-          <div key={`${l.price}-${i}`} className={`row${i === 0 ? " best" : ""}`} style={COLS}>
-            <span className="bar" style={{ width: `${(l.volume / max) * 100}%`, background: color }} />
-            <span className={`p${i === 0 ? " best" : ""}`} style={{ color }}>
-              {fmtPrice(l.price)}
+          <div key={`${l.price}-${i}`} className={`row${i === 0 ? " best" : ""}`}>
+            {/* 深度条塞进价格单元格里做绝对定位背景：表头和数据行同为 4 列，
+                列列对齐。之前 bar 当第 5 个 grid 子元素，"笔"整列掉到第二行。 */}
+            <span className="p">
+              <span className="bar" style={{ width: `${(l.volume / max) * 100}%`, background: color }} />
+              <span style={{ color: side === "ask" ? "var(--ask)" : "var(--bid)" }}>{fmtPrice(l.price)}</span>
             </span>
             <span className="v">{fmtVol(l.volume)}</span>
             <span className="v">{fmtVol(cum)}</span>
@@ -38,6 +38,7 @@ function Ladder({ side, levels }: { side: "ask" | "bid"; levels: PriceLevel[] })
 
 export default function OrderBook() {
   const detail = useStore((s) => s.detail);
+  const detailFor = useStore((s) => s.detailFor);
   const hubs = useStore((s) => s.hubs);
   const locationId = useStore((s) => s.locationId);
   const selectLocation = useStore((s) => s.selectLocation);
@@ -76,7 +77,16 @@ export default function OrderBook() {
       ) : view === "hist" ? (
         <HistoryChart typeId={selected} />
       ) : !detail ? (
-        <div className="empty">读取中…</div>
+        // 区分"还在读"与"真没有盘"：无快照行的类型 book_row 返回 null，
+        // 以前永远显示"读取中…"，用户会盯着一个永远不会来的加载转圈（走查 #10/#16）。
+        detailFor === selected ? (
+          <div className="empty">
+            这个类型在当前站点没有可显示的挂单 —— 可能全部被薄档（&lt;3 笔）或僵尸单（&gt;45 天）过滤，
+            也可能根本没人挂。换站点或等下一轮快照再看。
+          </div>
+        ) : (
+          <div className="empty">读取中…</div>
+        )
       ) : (
         <div className="book">
           <div className="ttl">{detail.name}</div>
@@ -90,7 +100,7 @@ export default function OrderBook() {
           </div>
 
           <div className="filters">
-            档位笔数：买 {detail.bid_levels} / 卖 {detail.ask_levels}
+            ⚙ 档位笔数：买 {detail.bid_levels} / 卖 {detail.ask_levels}
             <br />
             本类型被剔除：僵尸单 {detail.skipped_stale} · 薄档 {detail.skipped_thin} · 批发单{" "}
             {detail.skipped_wholesale}

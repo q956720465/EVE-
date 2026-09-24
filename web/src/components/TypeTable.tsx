@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useStore } from "../store";
 import { fmtPrice } from "../format";
@@ -29,6 +29,28 @@ export default function TypeTable() {
     estimateSize: () => 25,
     overscan: 12,
   });
+
+  // 键盘走选：↑↓/Home/End 以**当前选中行**为基准移动（不是被聚焦的那行 ——
+  // 只从聚焦点起算的话第二下就不动了，复验 E 抓到），选完把焦点追上去。
+  const onKeyDown = (e: ReactKeyboardEvent) => {
+    const cur = shown.findIndex((r) => r.type_id === selected);
+    const from = cur < 0 ? 0 : cur;
+    let next = from;
+    if (e.key === "ArrowDown") next = Math.min(shown.length - 1, from + 1);
+    else if (e.key === "ArrowUp") next = Math.max(0, from - 1);
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = shown.length - 1;
+    else return;
+    e.preventDefault();
+    const r = shown[next];
+    if (!r) return;
+    v.scrollToIndex(next);
+    void selectType(r.type_id);
+    // 新 DOM 要等选中引发重渲染后才存在；下一拍再把焦点接上，连按才不断。
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>(".vrow.sel")?.focus();
+    });
+  };
 
   return (
     <div className="pane" ref={parentRef} style={{ overflow: "auto" }}>
@@ -72,7 +94,10 @@ export default function TypeTable() {
                     height: item.size,
                   }}
                   onClick={() => void selectType(r.type_id)}
-                  title={`type_id ${r.type_id}`}
+                  // 名字列宽只有百来像素，截断时 hover 要看得到全名；type_id 一并给。
+                  title={`${r.name} · type_id ${r.type_id}`}
+                  tabIndex={0}
+                  onKeyDown={onKeyDown}
                 >
                   <span>{r.name || `#${r.type_id}`}</span>
                   <span className="r bid-txt">{fmtPrice(r.best_bid)}</span>

@@ -708,7 +708,10 @@ git commit -m "feat(core): 迁移 v6——角色元数据/钱包流水/挂单快
 **Files:** Create: `crates/emd-core/src/store/char_db.rs`；Modify: `crates/emd-core/src/store/mod.rs`
 
 **Interfaces:**
-- Produces（均为 `Db` 的 `impl` 方法）：`upsert_char_meta`、`char_meta`、`upsert_char_tx`、`load_char_tx`、`replace_char_orders`、`load_char_orders`、`prune_char_tx`、`save_alert`、`load_alerts`、`prune_alerts_cleared`
+- Produces（均为 `Db` 的 `impl` 方法）：`upsert_char_meta`、`char_meta`、`upsert_char_tx`、`load_char_tx`、`replace_char_orders`、`load_char_orders`、`prune_char_tx`
+
+> **控制器修正（2026-09-24）：** 原计划把 `save_alert`/`load_alerts`/`prune_alerts_cleared` 也放在本任务，但它们读写 `AlertRecord`——而 `AlertRecord` 要到 Task 9 才定义，本任务无法编译。三个告警持久化方法**移到 Task 9**（状态机与它的持久化本就该同处）。本任务只管 char 三表。
+> **另一条 Task 6 必须遵守的类型约定（来自 Task 5 评审）：** `alerts.alert_key` 是 **TEXT**，而 `char_tx.transaction_id` / `char_orders.order_id` 是 **INTEGER**。SQLite 跨存储类比较把 INTEGER 排在 TEXT 之前，`alert_key = transaction_id` 会**静默返回零行**而不报错。Task 8/9 写入与查询时必须用同一种规范文本形态（如 `tx:{id}` / `order:{id}`），或显式 CAST。
 
 - [ ] **Step 1: 写失败测试**（独立模块 `char_persist_tests`，照 M4b 的 `lifecycle_persist_tests` 先例）
 
@@ -719,13 +722,8 @@ fn char_tx_upsert_is_idempotent_and_orders_replace_is_whole_table() {
     // ② replace_char_orders 整表替换 → 旧订单消失（挂单会撤，不能留幽灵）
     // ③ prune_char_tx 按日期裁剪，90 天前的行消失
 }
-
-#[test]
-fn alert_roundtrip_keeps_payload_json_verbatim() {
-    // payload 列是 AlertPayload 的唯一序列化出口，读写必须逐字节稳定
-    // （推送与提醒中心共用它，漂移 = 手机与界面显示不一致）
-}
 ```
+（原计划的 `alert_roundtrip_keeps_payload_json_verbatim` 已随三个告警持久化方法一起移到 Task 9。）
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -848,10 +846,15 @@ git commit -m "feat(core): 三形态负收益判定（预期/套牢/已实现，
 
 ### Task 9: `alert/state.rs` — 告警状态机与闸门
 
-**Files:** Create: `crates/emd-core/src/alert/state.rs`；Modify: `crates/emd-core/src/alert.rs`
+**Files:**
+- Create: `crates/emd-core/src/alert/state.rs`
+- Create: `crates/emd-core/src/store/alert_db.rs`（告警持久化；DB 代码留在 store 层，`state.rs` 保持零 IO）
+- Modify: `crates/emd-core/src/alert.rs`、`crates/emd-core/src/store/mod.rs`
 
 **Interfaces:**
 - Produces: `AlertState::{New, Notified, Cleared}`（+`as_str`/`parse`）、`AlertRecord`、`tick_alert(prev, fired, now) -> Option<AlertRecord>`、`can_push(rec, now, today) -> bool`、`mark_pushed(rec, now, today)`、`ALERT_DAILY_CAP`、`ALERT_COOLDOWN_SECS`、`ALERT_DEEPEN_PP`
+- Produces（`Db` 的 `impl` 方法，位于 `store/alert_db.rs`；**从 Task 6 移来**——它们需要 `AlertRecord`，放在状态机旁边才能编译）：`save_alert`、`load_alerts`、`prune_alerts_cleared`
+- **`alert_key` 文本形态**：`alerts.alert_key` 是 TEXT，而 `transaction_id`/`order_id` 是 INTEGER。写入与查询必须用同一种规范文本形态（`order:{id}` / `tx:{id}`），否则 SQLite 跨存储类比较会静默返回零行。在 `AlertRecord` 的构造处集中实现，并加一例测试断言该形态。
 
 - [ ] **Step 1: 写失败测试**（照 M4b `lifecycle.rs` 的纯逻辑测试风格）
 

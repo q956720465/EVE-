@@ -331,3 +331,107 @@ async fn two_connections_on_one_file_share_the_schema() {
     drop(second);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- M4a：倒卖命令 -------------------------------------------------------
+
+#[tokio::test]
+async fn flip_params_roundtrip_through_app() {
+    let st = state_with(Db::in_memory().unwrap(), None);
+    let mut p = emd_core::market::FlipParams::default();
+    p.fees.accounting = 4;
+    p.margin_threshold_pct = 5.0;
+    st.flip_save(p.clone()).await.unwrap();
+    assert_eq!(st.flip_params().await.unwrap(), p);
+
+    let mut bad = emd_core::market::FlipParams::default();
+    bad.fees.accounting = 9;
+    assert!(st.flip_save(bad).await.is_err(), "越界技能必须拒绝");
+    assert_eq!(st.flip_params().await.unwrap(), p, "失败不得污染已存参数");
+}
+
+#[tokio::test]
+async fn trial_is_negative_by_default_and_positive_with_max_skills() {
+    let st = state_with(Db::in_memory().unwrap(), None);
+    // 默认官方费率 7.5/3：110×0.895 − 100 = −1.55 —— 试算行拦住的就是这种单。
+    let t = st.trial(100.0, 110.0, 10).await.unwrap();
+    assert!((t.net_per_unit + 1.55).abs() < 1e-9);
+    assert!(t.net_total < 0.0);
+    assert!(t.margin_pct < 0.0);
+
+    let mut max = emd_core::market::FlipParams::default();
+    max.fees.accounting = 5;
+    max.fees.broker_relations = 5;
+    st.flip_save(max).await.unwrap();
+    let t2 = st.trial(100.0, 110.0, 10).await.unwrap();
+    assert!((t2.net_per_unit - 4.6375).abs() < 1e-9, "满技能 110×0.95125");
+
+    // 输入防护：0 数量/负价直接拒绝，不进除法。
+    assert!(st.trial(100.0, 110.0, 0).await.is_err());
+    assert!(st.trial(-1.0, 110.0, 10).await.is_err());
+}
+
+#[tokio::test]
+async fn scan_flip_assembles_engine_output_with_names() {
+    let db = Db::in_memory().unwrap();
+    let mk = |loc: u64, asks: &[(f64, u64)], bids: &[(f64, u64)]| emd_core::market::StationOrderBook {
+        location_id: loc,
+        type_id: 34,
+        is_npc_station: true,
+        best_bid: bids.first().map(|&(p, _)| p),
+        bid_qty: bids.first().map(|&(_, v)| v).unwrap_or(0),
+        best_ask: asks.first().map(|&(p, _)| p),
+        ask_qty: asks.first().map(|&(_, v)| v).unwrap_or(0),
+        bid_levels: bids.len() as u32,
+        ask_levels: asks.len() as u32,
+        bid_depth: bids
+            .iter()
+            .map(|&(price, volume)| emd_core::market::PriceLevel { price, volume, orders: 5 })
+            .collect(),
+        ask_depth: asks
+            .iter()
+            .map(|&(price, volume)| emd_core::market::PriceLevel { price, volume, orders: 5 })
+            .collect(),
+        skipped_stale: 0,
+        skipped_thin: 0,
+        skipped_wholesale: 0,
+    };
+    db.write_snapshot(
+        &[
+            mk(emd_core::market::STATION_JITA, &[(100.0, 1000)], &[]),
+            mk(60015157, &[], &[(130.0, 1000)]),
+        ],
+        Some("lm"),
+    )
+    .unwrap();
+    db.write_hub_pool(&[
+        emd_core::market::Hub { location_id: emd_core::market::STATION_JITA, order_count: 100, share_pct: 50.0, rank: 1 },
+        emd_core::market::Hub { location_id: 60015157, order_count: 80, share_pct: 40.0, rank: 2 },
+    ])
+    .unwrap();
+    db.name_station(60015157, "Kisogo VII – AIR Laboratories", None).unwrap();
+    // 不绕过持久化校验：用默认 3% 阈值 + 真实盈利对
+    // （130×0.895 − 100 = 16.35/件），而不是负阈值（那会被且有理由被拒绝写入）。
+    let mut p = emd_core::market::FlipParams::default();
+    p.min_batch = 1;
+    p.capital_isk = 1_000_000.0;
+    db.set_flip_params(&p).unwrap();
+
+    let st = state_with(db, None);
+    let out = st.flip_scan().await.unwrap();
+    assert_eq!(out.rows.len(), 1);
+    let r = &out.rows[0];
+    assert_eq!(r.type_id, 34);
+    assert_eq!(r.type_name, "type_id 34", "inv_types 未建名时用 fallback 串");
+    assert_eq!(r.buy_loc_name, "站点 #60003760", "未解名站点用 fallback 串");
+    assert_eq!(r.sell_loc_name, "Kisogo VII – AIR Laboratories");
+    assert_eq!(r.qty, 500);
+    assert!((r.buy_price - 100.0).abs() < 1e-9);
+    assert!((r.sell_price - 130.0).abs() < 1e-9);
+    assert!((r.margin_pct - 16.35).abs() < 1e-9);
+    assert!((r.net_total - 8175.0).abs() < 1e-9);
+    assert_eq!(r.vol_source, "depth");
+    assert_eq!(r.vol24, 500);
+    assert_eq!(out.pairs_evaluated, 1);
+    assert_eq!(out.age_secs, None, "没有 round_log → 面板显示先跑采集");
+    assert_eq!(out.params, p, "扫完回显当前参数，面板无需再拉");
+}

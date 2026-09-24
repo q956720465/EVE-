@@ -57,6 +57,48 @@ pub struct HubRow {
     pub name: String,
 }
 
+/// 倒卖机会行：引擎输出 + 名字解析（前端表格直接渲染）。
+#[derive(Serialize)]
+pub struct FlipRow {
+    pub type_id: u32,
+    pub type_name: String,
+    pub buy_loc: u64,
+    pub buy_loc_name: String,
+    pub sell_loc: u64,
+    pub sell_loc_name: String,
+    pub buy_price: f64,
+    pub sell_price: f64,
+    pub qty: u64,
+    pub net_per_unit: f64,
+    pub net_total: f64,
+    pub margin_pct: f64,
+    pub vol24: u64,
+    /// "history" | "depth" —— 排序键来源角标。
+    pub vol_source: &'static str,
+    pub buy_levels: u32,
+    pub sell_levels: u32,
+}
+
+#[derive(Serialize)]
+pub struct FlipScanOut {
+    pub rows: Vec<FlipRow>,
+    pub pairs_evaluated: usize,
+    pub dropped_batch: usize,
+    pub dropped_shortfall: usize,
+    pub dropped_threshold: usize,
+    /// 快照年龄（秒）；None = 还没跑过采集。
+    pub age_secs: Option<i64>,
+    /// 参数面板回显（扫完即回，面板不用再单独拉）。
+    pub params: emd_core::market::FlipParams,
+}
+
+#[derive(Serialize)]
+pub struct TrialOut {
+    pub net_per_unit: f64,
+    pub net_total: f64,
+    pub margin_pct: f64,
+}
+
 #[derive(Serialize)]
 pub struct StatusOut {
     pub round: u64,
@@ -128,6 +170,90 @@ impl AppState {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// 倒卖扫描：装配输入 → 纯函数引擎 → 名字解析。
+    /// 名字回填失败不报错（用 fallback 串），名字缺失不该杀掉一张利润表。
+    async fn flip_scan(&self) -> Result<FlipScanOut, String> {
+        read(self.db.clone(), |db| {
+            let books = db.load_books().map_err(err)?;
+            let hubs = db.hub_pool().map_err(err)?;
+            let vol = db.latest_vol24().map_err(err)?;
+            let params = db.get_flip_params().map_err(err)?;
+            let age = db.last_round_age_secs().map_err(err)?;
+            let out = emd_core::market::scan(&books, &hubs, &params, &vol);
+            let mut rows = Vec::with_capacity(out.opportunities.len());
+            for o in out.opportunities {
+                let type_name = db
+                    .type_name(o.type_id)
+                    .map_err(err)?
+                    .unwrap_or_else(|| format!("type_id {}", o.type_id));
+                let buy_loc_name = db
+                    .station_name(o.buy_loc)
+                    .map_err(err)?
+                    .unwrap_or_else(|| format!("站点 #{}", o.buy_loc));
+                let sell_loc_name = db
+                    .station_name(o.sell_loc)
+                    .map_err(err)?
+                    .unwrap_or_else(|| format!("站点 #{}", o.sell_loc));
+                rows.push(FlipRow {
+                    type_id: o.type_id,
+                    type_name,
+                    buy_loc: o.buy_loc,
+                    buy_loc_name,
+                    sell_loc: o.sell_loc,
+                    sell_loc_name,
+                    buy_price: o.buy_price,
+                    sell_price: o.sell_price,
+                    qty: o.qty,
+                    net_per_unit: o.net_per_unit,
+                    net_total: o.net_total,
+                    margin_pct: o.margin_pct,
+                    vol24: o.vol24,
+                    vol_source: match o.vol_source {
+                        emd_core::market::VolSource::History => "history",
+                        emd_core::market::VolSource::Depth => "depth",
+                    },
+                    buy_levels: o.buy_levels,
+                    sell_levels: o.sell_levels,
+                });
+            }
+            Ok(FlipScanOut {
+                rows,
+                pairs_evaluated: out.stats.pairs_evaluated,
+                dropped_batch: out.stats.dropped_batch,
+                dropped_shortfall: out.stats.dropped_shortfall,
+                dropped_threshold: out.stats.dropped_threshold,
+                age_secs: age,
+                params,
+            })
+        })
+        .await
+    }
+
+    async fn flip_params(&self) -> Result<emd_core::market::FlipParams, String> {
+        read(self.db.clone(), |db| db.get_flip_params().map_err(err)).await
+    }
+
+    async fn flip_save(&self, p: emd_core::market::FlipParams) -> Result<(), String> {
+        read(self.db.clone(), move |db| db.set_flip_params(&p).map_err(err)).await
+    }
+
+    /// 试算：费率公式只在 emd-core 实现（spec R6），这里只做输入防护。
+    async fn trial(&self, buy_price: f64, sell_price: f64, qty: u64) -> Result<TrialOut, String> {
+        if qty == 0 {
+            return Err("数量必须大于 0".into());
+        }
+        if buy_price < 0.0 || sell_price < 0.0 {
+            return Err("价格不能为负".into());
+        }
+        read(self.db.clone(), move |db| {
+            let params = db.get_flip_params().map_err(err)?;
+            let (net_per_unit, net_total, margin_pct) =
+                emd_core::market::trial(buy_price, sell_price, qty, &params);
+            Ok(TrialOut { net_per_unit, net_total, margin_pct })
         })
         .await
     }
@@ -327,6 +453,34 @@ async fn get_status(state: State<'_, AppState>) -> Result<StatusOut, String> {
 #[tauri::command]
 async fn search_types(state: State<'_, AppState>, word: String) -> Result<Vec<ListingRow>, String> {
     state.search(&word).await
+}
+
+#[tauri::command]
+async fn scan_flip(state: State<'_, AppState>) -> Result<FlipScanOut, String> {
+    state.flip_scan().await
+}
+
+#[tauri::command]
+async fn get_flip_params(state: State<'_, AppState>) -> Result<emd_core::market::FlipParams, String> {
+    state.flip_params().await
+}
+
+#[tauri::command]
+async fn set_flip_params(
+    state: State<'_, AppState>,
+    params: emd_core::market::FlipParams,
+) -> Result<(), String> {
+    state.flip_save(params).await
+}
+
+#[tauri::command]
+async fn trial_calc(
+    state: State<'_, AppState>,
+    buy_price: f64,
+    sell_price: f64,
+    qty: u64,
+) -> Result<TrialOut, String> {
+    state.trial(buy_price, sell_price, qty).await
 }
 
 /// 只回话"还要等多久"，不代替调度器发起采集。
@@ -550,6 +704,10 @@ pub fn run() {
             add_watch,
             remove_watch,
             search_types,
+            scan_flip,
+            get_flip_params,
+            set_flip_params,
+            trial_calc,
             request_refresh
         ])
         .build(tauri::generate_context!())

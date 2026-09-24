@@ -28,6 +28,9 @@ pub use char::{sync_character, CharSyncReport, JournalEntry, SkillLevel};
 pub use char::fifo::{fifo_costs, CostSource, FifoCost};
 pub use config::EsiConfig;
 pub use error::{Error, Result};
+pub use push::{
+    dispatch, mask, DingTalkChannel, LocalChannel, PushChannel, PushConfig, PushConfigEcho,
+};
 
 /// 便捷构造：默认配置 + 指定 UA。
 pub fn client(user_agent: impl Into<String>) -> Result<esi::EsiClient> {

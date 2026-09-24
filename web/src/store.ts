@@ -41,7 +41,8 @@ interface State {
   tick(): Promise<void>;
   setView(view: View): void;
   loadFlip(): Promise<void>;
-  saveFlipParams(p: FlipParams): Promise<void>;
+  /** 返回是否保存成功——失败时调用方不得清 dirty（否则静默回滚用户输入）。 */
+  saveFlipParams(p: FlipParams): Promise<boolean>;
   setFlipSort(k: FlipSortKey): void;
   runTrial(buy: number, sell: number, qty: number): Promise<void>;
 }
@@ -170,8 +171,11 @@ export const useStore = create<State>((set, get) => ({
       await api.setFlipParams(p);
       // 参数/技能改完立即重扫：纯本地纯函数，零 ESI 请求（spec §3.1 的重算闭环）。
       await get().loadFlip();
+      return true;
     } catch (e) {
+      // 不能把错误吞掉后假装成功：调用方要靠返回值决定是否清 dirty。
       set({ error: String(e) });
+      return false;
     }
   },
 

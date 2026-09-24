@@ -207,7 +207,11 @@ export default function FlipScanner() {
                 <button
                   className={dirty ? "on" : ""}
                   onClick={() => {
-                    void saveFlipParams(p).then(() => setDirty(false));
+                    // 只有真保存成功才清 dirty：失败时保持脏标记与用户输入，
+                    // 否则后端拒绝会被回显覆盖成"已保存"的假象。
+                    void saveFlipParams(p).then((ok) => {
+                      if (ok) setDirty(false);
+                    });
                   }}
                   title="写入参数并立即用当前快照重扫（纯本地，不发 ESI 请求）"
                 >

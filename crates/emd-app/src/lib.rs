@@ -247,12 +247,14 @@ impl AppState {
     }
 
     /// 试算：费率公式只在 emd-core 实现（spec R6），这里只做输入防护。
+    /// 价格必须 >0：0 会被 settle 判成"成本非正"返回全零，界面按
+    /// `net_total < 0` 判色会渲染成绿色的"0.00 收益"——错误信号比报错更糟。
     async fn trial(&self, buy_price: f64, sell_price: f64, qty: u64) -> Result<TrialOut, String> {
         if qty == 0 {
             return Err("数量必须大于 0".into());
         }
-        if buy_price < 0.0 || sell_price < 0.0 {
-            return Err("价格不能为负".into());
+        if !(buy_price > 0.0) || !(sell_price > 0.0) {
+            return Err("买价/卖价必须是大于 0 的数字".into());
         }
         read(self.db.clone(), move |db| {
             let params = db.get_flip_params().map_err(err)?;

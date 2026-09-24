@@ -365,8 +365,9 @@ async fn trial_is_negative_by_default_and_positive_with_max_skills() {
     let t2 = st.trial(100.0, 110.0, 10).await.unwrap();
     assert!((t2.net_per_unit - 4.6375).abs() < 1e-9, "满技能 110×0.95125");
 
-    // 输入防护：0 数量/负价直接拒绝，不进除法。
+    // 输入防护：0 数量/0 或负价直接拒绝，不进除法也不渲染成"绿色 0 收益"。
     assert!(st.trial(100.0, 110.0, 0).await.is_err());
+    assert!(st.trial(0.0, 110.0, 10).await.is_err(), "0 买价必须拒绝");
     assert!(st.trial(-1.0, 110.0, 10).await.is_err());
 }
 

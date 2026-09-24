@@ -208,18 +208,12 @@ pub fn scan(
                     out.stats.dropped_shortfall += 1;
                     continue;
                 }
-
-                let q = qty as f64;
-                let net_sell = sell_px * q * (1.0 - broker - tax); // 税基 = 全额
-                let mut cost = buy_px * q + p.freight_isk_per_unit * q;
-                if p.include_buy_broker {
-                    cost += buy_px * q * broker;
-                }
-                if cost <= 0.0 {
+                // 净额/成本装配与 trial 共用同一份实现（spec R6 防漂移）。
+                let Some((net_per_unit, net_total, margin_pct)) =
+                    settle(buy_px, sell_px, qty, p, broker, tax)
+                else {
                     continue;
-                }
-                let net = net_sell - cost;
-                let margin_pct = net / cost * 100.0;
+                };
                 if margin_pct < p.margin_threshold_pct {
                     out.stats.dropped_threshold += 1;
                     continue;
@@ -238,8 +232,8 @@ pub fn scan(
                     buy_price: buy_px,
                     sell_price: sell_px,
                     qty,
-                    net_per_unit: net / q,
-                    net_total: net,
+                    net_per_unit,
+                    net_total,
                     margin_pct,
                     vol24: v24,
                     vol_source: src,
@@ -264,22 +258,37 @@ pub fn scan(
     out
 }
 
-/// 单笔试算（spec §2.4）：与 scan 共用同一费率出口，负数 = 扣税后亏损。
-/// 返回 `(单位净利, 总净利, 净利率%)`。
+/// 净额/成本装配的唯一实现（spec R6）：scan 与 trial 必须共用一份，
+/// 否则"扫描出的机会"与"试算的单"会在改口径时漂移。
+/// 返回 `(单位净利, 总净利, 净利率%)`；成本非正无法计率 → None。
+fn settle(
+    buy_px: f64,
+    sell_px: f64,
+    qty: u64,
+    p: &FlipParams,
+    broker: f64,
+    tax: f64,
+) -> Option<(f64, f64, f64)> {
+    let q = qty as f64;
+    let net_sell = sell_px * q * (1.0 - broker - tax); // 税基 = 卖出全额
+    let mut cost = buy_px * q + p.freight_isk_per_unit * q;
+    if p.include_buy_broker {
+        cost += buy_px * q * broker;
+    }
+    if cost <= 0.0 {
+        return None;
+    }
+    let net = net_sell - cost;
+    Some((net / q, net, net / cost * 100.0))
+}
+
+/// 单笔试算（spec §2.4）：与 scan 共用同一费率出口。
+/// 返回 `(单位净利, 总净利, 净利率%)`，负数 = 扣税后亏损。
 pub fn trial(buy_price: f64, sell_price: f64, qty: u64, p: &FlipParams) -> (f64, f64, f64) {
     let broker = p.fees.effective_broker();
     let tax = p.fees.effective_sales_tax();
-    let q = qty as f64;
-    let net_sell = sell_price * q * (1.0 - broker - tax);
-    let mut cost = buy_price * q + p.freight_isk_per_unit * q;
-    if p.include_buy_broker {
-        cost += buy_price * q * broker;
-    }
-    if cost <= 0.0 {
-        return (0.0, 0.0, 0.0);
-    }
-    let net = net_sell - cost;
-    (net / q, net, net / cost * 100.0)
+    // 成本非正（极端输入）→ 全零；正常路径已被命令层防护（价格须 >0）。
+    settle(buy_price, sell_price, qty, p, broker, tax).unwrap_or((0.0, 0.0, 0.0))
 }
 
 #[cfg(test)]

@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::error::{Error, Result};
+
 /// 令牌成本：实测 `X-Ratelimit-Used` 逐条验证 —— 2xx=2、3xx=1、4xx=5、5xx=0。
 pub mod cost {
     pub const OK: u32 = 2;
@@ -96,6 +98,9 @@ impl EsiConfig {
 pub struct CharConfig {
     pub client_id: String,
     pub redirect_uri: String,
+    /// **默认** `redirect_uri` 里烧进的那个端口（`http://127.0.0.1:8765/callback`）。
+    /// 生产**不读它**：绑定端口一律由 [`CharConfig::callback_port`] 从 `redirect_uri` 现算 ——
+    /// `redirect_uri` 才是权威（EVE 逐字符匹配注册值），独立端口字段只会和它漂移。
     pub loopback_port: u16,
     /// 总开关：`EMD_CHAR_SYNC=0` 关闭。
     pub enabled: bool,
@@ -140,6 +145,40 @@ impl CharConfig {
             ..d
         }
     }
+
+    /// 从 `redirect_uri` 里解出回调端口（`scheme://host:port/path` 的 authority 段那个显式端口）。
+    ///
+    /// **为什么以 URI 为准**：EVE 对 `redirect_uri` 与开发者后台注册值做逐字符匹配，
+    /// 所以回环绑定的端口必须跟着 URI 走；另立一个端口字段早晚会与 URI 漂移，
+    /// 而漂移的表现是"浏览器落到空处 → 白等满 180 s → 只换来一句不提到端口与 URI 的超时"。
+    /// 解不出就返回配置错、让用户在开浏览器**之前**看到；绝不静默回落到别的端口。
+    ///
+    /// 手写解析而不引 `url` crate：本 workspace 没有该依赖，而这里只需要 authority 里
+    /// `host:port` 的一段。冒号**从右往左**找，`[::1]:8765` 这类 IPv6 字面量的主机段冒号不会被误当分隔符。
+    pub fn callback_port(&self) -> Result<u16> {
+        let uri = self.redirect_uri.as_str();
+        let authority = uri
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .ok_or_else(|| bad_redirect_uri(uri, "缺少 scheme://"))?
+            // authority 到第一个 `/`、`?` 或 `#` 为止。
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        let (_, port) = authority
+            .rsplit_once(':')
+            .filter(|(host, port)| !host.is_empty() && !port.is_empty())
+            .ok_or_else(|| bad_redirect_uri(uri, "URI 里没有显式端口"))?;
+        port.parse::<u16>()
+            .map_err(|_| bad_redirect_uri(uri, "端口不是 0-65535 的整数"))
+    }
+}
+
+/// `callback_port` 的失败话术：点名要改的键与期望形状 —— 用户不必翻代码就知道怎么改。
+fn bad_redirect_uri(uri: &str, why: &str) -> Error {
+    Error::Config(format!(
+        "EMD_CHAR_REDIRECT_URI 里解不出回调端口（{why}）：{uri:?}。请写成带显式端口的形状，如 EMD_CHAR_REDIRECT_URI=http://127.0.0.1:8765/callback（端口须与开发者后台注册的回调地址逐字符一致）"
+    ))
 }
 
 #[cfg(test)]
@@ -199,6 +238,38 @@ mod tests {
         assert_eq!(cfg.loopback_port, 8765);
         // 端口必须与 redirect_uri 里的那个一致（回环只绑这一个口）。
         assert!(cfg.redirect_uri.contains(&cfg.loopback_port.to_string()));
+    }
+
+    #[test]
+    fn callback_port_is_derived_from_the_redirect_uri() {
+        // 端口必须跟着 `redirect_uri` 走：EVE 逐字符匹配注册值，绑定端口没有第二个来源。
+        assert_eq!(CharConfig::default().callback_port().unwrap(), 8765);
+
+        // 回调搬到别的端口：绑定的端口随之搬（`loopback_port` 留着 8765 也不许被采用）。
+        let moved = CharConfig {
+            redirect_uri: "http://127.0.0.1:9999/cb".into(),
+            ..Default::default()
+        };
+        assert_eq!(moved.callback_port().unwrap(), 9999);
+
+        // 没有显式端口：报可照着改的配置错，绝不静默回落（回落 = 绑一个端口、浏览器落到空处、
+        // 白等满 180 s 只换来一句不提到端口与 URI 的超时）。
+        let no_port = CharConfig {
+            redirect_uri: "http://127.0.0.1/callback".into(),
+            ..Default::default()
+        };
+        let err = no_port.callback_port().unwrap_err().to_string();
+        assert!(err.contains("EMD_CHAR_REDIRECT_URI"), "要点名去改哪个键：{err}");
+        assert!(err.contains("http://127.0.0.1:8765/callback"), "要给出期望形状：{err}");
+
+        // 其余畸形形状同样一律报错：端口越界、缺 scheme、authority 为空。
+        for bad in ["http://127.0.0.1:70000/cb", "127.0.0.1:8765/callback", "http:///cb"] {
+            let cfg = CharConfig {
+                redirect_uri: bad.into(),
+                ..Default::default()
+            };
+            assert!(cfg.callback_port().is_err(), "形状不对必须报错：{bad}");
+        }
     }
 
     #[test]

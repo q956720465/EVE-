@@ -591,16 +591,22 @@ impl AppState {
     /// 的前提下改配置的入口），保存成功后回一份新的打码回显 —— 面板据此刷新，
     /// 而不是拿用户输入自己拼（输入里的打码 webhook 与库里的真值不是一回事）。
     async fn alert_settings_save(&self, input: AlertSettingsIn) -> Result<AlertSettings, String> {
+        // 粘贴到输入框的值首尾常带空格，而 base64 密钥与 webhook URL 都不含合法空白：
+        // 原样存下去会让请求 URL/加签串多出空格 → 310000 → 通道被禁用，提示话术却去怪机器人
+        // （配置面上看不出任何毛病）。故在入口一次性去净。
+        // 只有空白的密钥去净后就是空串 = 显式「清空」（`Some("")`）—— 那正是用户键入内容的字面意思。
+        let webhook = input.webhook.trim().to_string();
+        let secret = input.secret.map(|s| s.trim().to_string());
         read(self.db.clone(), move |db| {
             let echo = PushConfigEcho {
                 // 打码串由 `save_editing` 解读为"保留库里那条"；明文则是新值。
-                webhook: input.webhook,
+                webhook,
                 // `save_editing` 不看这个字段（密钥只走 `new_secret`，它才带得起三态），
                 // 填什么都不会进库 —— 占位而已。
                 secret_set: false,
                 enabled: input.enabled,
             };
-            PushConfig::save_editing(db, &echo, input.secret.as_deref()).map_err(err)?;
+            PushConfig::save_editing(db, &echo, secret.as_deref()).map_err(err)?;
             let saved = PushConfig::load(db).map_err(err)?;
             Ok(settings_of(&saved))
         })
@@ -674,12 +680,16 @@ impl AppState {
                     .into(),
             );
         }
-        // 四个参数全部来自配置：`redirect_uri` 与端口必须逐字符等于开发者后台的注册值，
-        // 由用户配、代码不代猜。超时 180 s 是"用户手点授权"的合理上限。
+        // 端口从 `redirect_uri` 现算（它是权威：EVE 逐字符匹配注册值），**不读 `loopback_port`** ——
+        // 两者不一致时用户会白等满 180 s 只换来一句没提端口与 URI 的超时。
+        // 解析失败与上面的空 `client_id` 同一纪律：在打开浏览器**之前**当场拒绝，
+        // 错误里带着可照着改的形状。
+        let port = self.cfg.callback_port().map_err(err)?;
+        // 其余参数全部来自配置、代码不代猜；超时 180 s 是"用户手点授权"的合理上限。
         let out = login(
             &self.cfg.client_id,
             &self.cfg.redirect_uri,
-            self.cfg.loopback_port,
+            port,
             self.tokens.as_ref(),
             Duration::from_secs(180),
         )

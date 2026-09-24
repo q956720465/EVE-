@@ -788,6 +788,42 @@ async fn alert_settings_keep_the_secret_unless_explicitly_cleared() {
         .unwrap();
     assert_eq!(saved.webhook, "", "空 webhook 回显也是空串");
     assert_eq!(saved.channels, vec!["local"], "webhook 空着 → 钉钉不在场");
+
+    // ⑦ 粘贴带首尾空格（常见）：webhook 与密钥都必须在入口去净 —— 空格进了加签串/请求 URL
+    //    就是 310000，而配置面上看不出任何毛病。带空格存一次与不带空格存一次，回显逐字符一致。
+    let padded = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: format!("  {new_webhook} \t"),
+            secret: Some(format!(" {SECRET}3 ")),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let stored = stored_push_config(&st);
+    assert_eq!(stored.webhook, new_webhook, "webhook 首尾空格去净后入库");
+    assert_eq!(stored.secret, format!("{SECRET}3"), "密钥首尾空格同样去净（不是被当成空值清掉）");
+    let plain = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: new_webhook.clone(),
+            secret: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(padded.webhook, plain.webhook, "带空格与不带空格的 webhook 回显必须一致");
+
+    // ⑧ 纯空白密钥（粘贴走样）：去净后就是空串 = 显式「清空」—— 那正是用户键入内容的字面意思；
+    //    若把两个空格原样存下去，加签会算出一个错的签名（310000），配置面上却显示「已配置」。
+    let saved = st
+        .alert_settings_save(AlertSettingsIn {
+            webhook: new_webhook.clone(),
+            secret: Some("  ".to_string()),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert!(!saved.secret_set, "纯空白密钥按「清空」处理");
+    assert_eq!(stored_push_config(&st).secret, "", "库里确实是空的，不是那两个空格");
 }
 
 #[tokio::test]
@@ -893,4 +929,28 @@ async fn sso_login_fails_fast_without_a_client_id() {
     );
     let err = st.sso_login().await.expect_err("没配 client_id 必须当场拒绝");
     assert!(err.contains("EMD_CHAR_CLIENT_ID"), "要说清去改哪个键：{err}");
+}
+
+#[tokio::test]
+async fn sso_login_fails_fast_when_the_redirect_uri_has_no_explicit_port() {
+    // 绑定端口必须从 `redirect_uri` 派生（EVE 逐字符匹配注册值）：URI 里没有显式端口时，
+    // 若还去绑 `loopback_port`，浏览器会落到空处、用户白等满 180 秒只换来一句没提端口与 URI
+    // 的「SSO 登录超时」—— 所以这里必须与空 client_id 同一纪律：在打开浏览器之前当场拒绝。
+    // 本测试不打网络、不开浏览器（`login` 根本不会被调用；真走进去至少要等 180 s，跑不到这里）。
+    let st = state_sso(
+        Db::in_memory().unwrap(),
+        Arc::new(MemoryTokenStore::default()),
+        CharConfig {
+            client_id: "test-client-id".into(),
+            redirect_uri: "http://127.0.0.1/callback".into(),
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    let started = Instant::now();
+    let err = st.sso_login().await.expect_err("URI 没有显式端口必须当场拒绝");
+    assert!(err.contains("EMD_CHAR_REDIRECT_URI"), "要说清去改哪个键：{err}");
+    assert!(err.contains("http://127.0.0.1:8765/callback"), "要给出可照着改的形状：{err}");
+    assert!(!err.contains("超时"), "不许走进 login 的那 180 s 等待：{err}");
+    assert!(started.elapsed() < Duration::from_secs(5), "必须当场返回，不能进入 login 的回环等待");
 }

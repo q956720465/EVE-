@@ -10,17 +10,12 @@ import type { HistoryBar } from "../types";
 // 按需注册：整包 echarts 会把体积翻几倍，这里只挂蜡烛图这条链路用到的部件。
 echarts.use([BarChart, CandlestickChart, DataZoomComponent, GridComponent, TooltipComponent, CanvasRenderer]);
 
-// 上游滚动窗口实测只有 418 天（附录 A.4），"1Y" 就取满它，别装作有更长。
-const RANGES = [
-  { key: "1W", days: 7 },
-  { key: "1M", days: 30 },
-  { key: "3M", days: 90 },
-  { key: "1Y", days: 418 },
-] as const;
-
 /**
  * 单类型日线蜡烛图。ESI 的 history 只有 `(region, type)` 维度、没有站点维度，
  * 所以这张图永远是"该星域均价的时间序列"，不能拿来比较站点（方案 §3.3）。
+ *
+ * 一张图画完全部本地历史（上游窗口最多 418 天）：不再做 1W/1M 区间按钮，
+ * 看局部用图下方的缩放滑块拖选、图上滚轮平移即可。
  */
 export default function HistoryChart({ typeId }: { typeId: number }) {
   // callback ref：容器随"有无数据"分支挂载/卸载，useRef 拿不到重挂后的节点。
@@ -32,10 +27,6 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
     bars: [],
     loading: true,
   });
-  const [range, setRange] = useState<(typeof RANGES)[number]>(RANGES[1]);
-  // 只有点区间按钮才 bump：触发 setOption 时把 dataZoom 复位。
-  // 不复位的话，1M 下拖过的缩放窗口会残留到 1Y 上 —— 验收抓到过"1Y 只有 6 周"。
-  const [zoomEpoch, setZoomEpoch] = useState(0);
   const [name, setName] = useState("");
   const { bars, loading } = data;
 
@@ -74,10 +65,8 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
       return;
     }
 
-    const from = new Date();
-    from.setUTCDate(from.getUTCDate() - range.days);
-    const fromStr = from.toISOString().slice(0, 10);
-    const rows = bars.filter((b) => b.date >= fromStr && b.average !== null);
+    // 一张图装全部：只滤掉无均价的日子，不再按窗口截断。
+    const rows = bars.filter((b) => b.average !== null);
 
     const cats = rows.map((b) => b.date);
     // ECharts 蜡烛的数据序是 [open, close, lowest, highest]；
@@ -142,7 +131,7 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
       ],
       // notMerge：区间切换时行集整个换掉，合并模式会把旧 series 的残留 dataZoom 区间留下。
     }, { notMerge: false });
-  }, [bars, range, zoomEpoch, box, loading]);
+  }, [bars, box, loading]);
 
   // 窗口/分栏宽度一变，画布不会自己重排；不监听的话图会被拉宽压扁到下次 setOption。
   useEffect(() => {
@@ -160,41 +149,24 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
     [],
   );
 
-  // 想要的窗口比手里的历史还长：说清楚"不是图坏了，是本地只攒了这么多天"。
-  const short = !loading && bars.length > 0 && bars.length < range.days;
+  // 索引访问在 strict 下是 |undefined，取首尾行显式落变量而不是链式下标。
+  const first = bars[0];
+  const last = bars[bars.length - 1];
 
   return (
     <div className="hist">
       <div className="hist-ttl">
-        {name || `type_id ${typeId}`} · {range.key} 日线
+        {name || `type_id ${typeId}`} · 日线全部历史
       </div>
       <div className="hist-tabs">
-        {/* 分钟线数据源（ticker_intraday）不在 M3 范围，按钮置灰而不是藏掉：
-            藏了用户会以为 1D 是坏了，置灰配 tooltip 才说得清"这档还没有数据"。 */}
-        <button disabled title="分钟线（ticker_intraday）后续里程碑再开">
-          1D
-        </button>
-        {RANGES.map((r) => (
-          <button
-            key={r.key}
-            className={range.key === r.key ? "on" : ""}
-            onClick={() => {
-              setRange(r);
-              setZoomEpoch((e) => e + 1);
-            }}
-          >
-            {r.key}
-          </button>
-        ))}
-        <span className="cov" title="按该类型实际积累天数计，不是全局均值（方案 §3.3）">
-          本地已积累 {bars.length} 天
+        {/* 直白计数：起止日期 + 天数，不用 "1Y/已积累" 这类术语。
+            上游窗口实测最多 418 天（附录 A.4）。 */}
+        <span className="cov" title="按该类型自己的天数计，不是所有类型的平均值">
+          {first && last
+            ? `共 ${bars.length} 天：${first.date} 至 ${last.date}`
+            : "共 0 天"}
         </span>
       </div>
-      {short && (
-        <div className="hint" style={{ margin: "0 0 6px" }}>
-          本地历史只有 {bars.length} 天，不足 {range.key} 窗口 —— 图上就是全部了，T3 每天续一天。
-        </div>
-      )}
       {loading ? (
         <div className="empty">读取历史…</div>
       ) : bars.length === 0 ? (
@@ -203,10 +175,12 @@ export default function HistoryChart({ typeId }: { typeId: number }) {
           也可用 emd history --type {typeId} 手动补一次。
         </div>
       ) : (
-        <div ref={setBox} style={{ width: "100%", height: 340 }} />
+        // 没有区间按钮后图就是唯一主角，给足高度；左右拖动看局部用下方滑块。
+        <div ref={setBox} style={{ width: "100%", height: 420 }} />
       )}
       <div className="note">
         历史是 (星域, 类型) 维度、无站点维度：图上是 The Forge 的日均价，跨站对比只有当前快照。
+        滚轮或底部滑块可放大拖动看局部。
       </div>
     </div>
   );

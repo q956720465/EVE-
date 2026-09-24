@@ -83,21 +83,24 @@ function g(group_id: number, name: string, type_count: number): TreeGroup {
 }
 
 function fixTree(): TreeNode[] {
+  // 树里的类型数 = fixListing 真能摆出来的行数：生产已把 tree 计数改成与
+  // 列表同源（inv_types），fixture 不同步就会继续演"16 vs 9"的口径矛盾。
+  const n = 9;
   return [
     {
       category_id: 10,
       name: "Material Elements",
-      groups: [g(18, "Noble Metals", 16), g(25, "Base Minerals", 38), g(489, "Ore", 24)],
+      groups: [g(18, "Noble Metals", n), g(25, "Base Minerals", n), g(489, "Ore", n)],
     },
     {
       category_id: 11,
       name: "Commodities",
-      groups: [g(420, "Component", 260), g(563, "Capacitor Boosters", 41)],
+      groups: [g(420, "Component", n), g(563, "Capacitor Boosters", n)],
     },
     {
       category_id: 18,
       name: "Ship",
-      groups: [g(301, "Frigate", 420), g(302, "Destroyer", 280), g(420, "Battlecruiser", 210)],
+      groups: [g(301, "Frigate", n), g(302, "Destroyer", n), g(420, "Battlecruiser", n)],
     },
   ];
 }

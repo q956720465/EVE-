@@ -16,7 +16,8 @@ export default function CatalogTree() {
           <div key={c.category_id}>
             <div className="cat" onClick={() => toggle(c.category_id)}>
               {open ? "▾" : "▸"} {c.name}
-              <span className="n"> · {c.groups.length}</span>
+              {/* 裸数字看不懂是什么的数：直写成"N 个组"。 */}
+              <span className="n"> · {c.groups.length} 个组</span>
             </div>
             {open &&
               c.groups.map((g) => (
@@ -27,7 +28,7 @@ export default function CatalogTree() {
                   title={`group_id ${g.group_id}`}
                 >
                   <span>{g.name}</span>
-                  <span className="n">{g.type_count}</span>
+                  <span className="n">{g.type_count} 个类型</span>
                 </div>
               ))}
           </div>

@@ -22,7 +22,7 @@ pub mod tree;
 
 pub use alert::{
     consumed_lot_costs, detect_buy_trap, detect_expected_sell, detect_realized, order_alert_key,
-    tx_alert_key, AlertKind, AlertPayload, CaliberSummary, NameLookup,
+    tx_alert_key, AlertKind, AlertPayload, AlertRoundReport, CaliberSummary, NameLookup,
 };
 pub use char::{sync_character, CharSyncReport, JournalEntry, SkillLevel};
 pub use char::fifo::{fifo_costs, CostSource, FifoCost};

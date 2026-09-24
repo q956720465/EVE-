@@ -34,16 +34,25 @@
 //!
 //! 字段核对：② 的净额系数、③ 的三项构成都逐字照 spec §4.3；`AlertPayload` 的十四个字段
 //! 逐字段照抄（推送卡片与提醒中心共用这一份序列化，杜绝双源漂移）。
+//!
+//! **装配层**：[`update_round`] 是本文件**唯一有 IO 的入口**（读库 → 同步 → 落库 → 派发），
+//! 判定与状态机全是纯函数，一行不掺。它的步骤顺序本身就是契约（P2/P3/P4/P5/P7），逐条写在
+//! 那个函数的文档里 —— 顺序错了既不报错也不抛异常，只会**静默少报或误报**，那正是这几条
+//! 顺序要防的东西。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::char::fifo::{CostSource, FifoCost};
-use crate::char::JournalEntry;
+use crate::char::fifo::{fifo_costs, CostSource, FifoCost};
+use crate::char::{sync_character_with, JournalEntry};
+// 刻意**不** `use crate::error::Result`：本文件有手写的 serde 实现，那几处 `Result<S::Ok, S::Error>`
+// 必须是 `std::result::Result` —— 把 crate 的 Result 引进同一命名空间会把它们全打红。
+use crate::esi::EsiClient;
 use crate::market::{FeeModel, Side, StationOrderBook};
-use crate::store::{CharOrder, WalletTx};
+use crate::push::{dispatch, PushChannel, PushOutcome};
+use crate::store::{CharOrder, Db, WalletTx};
 
 mod state;
 
@@ -526,6 +535,11 @@ pub fn detect_buy_trap(
 ///
 /// 另注：T7 的 `JournalEntry` 没保留 ESI 的 `context_id_type` 字段，否则归属能在运行时自证 ——
 /// 属 T7 文件，已记进 T8 报告。
+///
+/// **这是 journal 真值的唯一消费点**（[`update_round`] 在同步返回后**立刻**调它，P3）：
+/// journal 是 at-most-once 的东西 —— T7 在 fetch 时就推进了 `journal_cursor`，而 v6 没有
+/// journal 表，所以这一轮没抽成内存字典的条目**下一轮再也拿不回来**。抽出来之后判定侧只认
+/// 这两张字典（[`detect_realized_with`]），不再回头读 slice：否则"消费"只是个说法。
 fn journal_truth(journal: &[JournalEntry]) -> (HashMap<i64, f64>, HashMap<i64, f64>) {
     let mut tax_by_tx: HashMap<i64, f64> = HashMap::new();
     let mut broker_by_order: HashMap<i64, f64> = HashMap::new();
@@ -619,9 +633,23 @@ pub fn detect_realized(
     names: &NameLookup,
     now: i64,
 ) -> Vec<AlertPayload> {
+    let (tax_by_tx, broker_by_order) = journal_truth(journal);
+    detect_realized_with(txs, orders, &tax_by_tx, &broker_by_order, names, now)
+}
+
+/// 与 [`detect_realized`] 同一判据（同一段实现，参数表只差"真值已经在手"），供装配层用：
+/// journal 真值由 [`journal_truth`] 在同步返回后立刻抽出（P3 的消费点），判定侧拿到的就是
+/// 那两张字典 —— 不在这个函数里再解析一次 slice，避免"消费"变成两处口径。
+fn detect_realized_with(
+    txs: &[WalletTx],
+    orders: &[CharOrder],
+    tax_by_tx: &HashMap<i64, f64>,
+    broker_by_order: &HashMap<i64, f64>,
+    names: &NameLookup,
+    now: i64,
+) -> Vec<AlertPayload> {
     let sale_costs = consumed_lot_costs(txs);
     let origin = match_origin_orders(txs, orders);
-    let (tax_by_tx, broker_by_order) = journal_truth(journal);
 
     let mut out = Vec::new();
     for t in txs.iter().filter(|t| !t.is_buy) {
@@ -643,7 +671,7 @@ pub fn detect_realized(
         // 卖出侧实付中介费：就是这张挂单下单时被划走的那笔。买入侧**不计** ——
         // 本机既没有挂单原量、也没有"这几件货来自哪张买单"的归属数据（见模块头第 3 条），
         // 按比例摊就是编数字；公式串里写明了这一项缺席。
-        let broker = cash(&broker_by_order, order_id);
+        let broker = cash(broker_by_order, order_id);
         let income = t.unit_price * t.quantity as f64;
         let consumed = unit_cost * t.quantity as f64;
         let net = income - tax;
@@ -699,12 +727,229 @@ pub fn detect_realized(
     out
 }
 
+// ---------------------------------------------------------------------------
+// 装配（本文件唯一有 IO 的一段；判定与状态机一行都不改）
+// ---------------------------------------------------------------------------
+
+/// 一轮告警回合的台账（调度器的日志、daemon 与提醒中心的展示消费它）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AlertRoundReport {
+    /// 本轮四端点受理的行数之和（挂单快照 + 窗口内流水 + journal + 技能读数）。
+    /// 它衡量的是"这一轮拿回来多少东西"，**不是"新入库多少行"**：增量窗会重叠，同一行会被重放。
+    pub synced: usize,
+    /// 本轮判定出的亏损条目数（三形态合计，**闸门之前**）。
+    pub detected: usize,
+    /// 本轮真的派发出去、且至少一条通道回了 [`PushOutcome::Sent`] 的条目数。
+    pub pushed: usize,
+    /// 被闸门拦下的条目数（冷却中 / 当日额度已尽）。这些条目**照样进提醒中心** ——
+    /// 闸门只管推不推，从不删行（spec §4.4），所以它是"少推了几条"，不是"丢了几条"。
+    pub suppressed: usize,
+}
+
+/// 一轮角色同步 + 告警回合（**M4c 的装配入口**，与 `lifecycle::update_round` 同一分工：
+/// 读库 / 网络 / 落库都在这里，判定与状态机是纯函数）。
+///
+/// 顺序是**契约**，不许重排 —— 每一步的位置都对应一个具体的、不会报错的失败形态：
+///
+/// | 步 | 做什么 | 为什么必须在这个位置 |
+/// |---|---|---|
+/// | ① | 同步**之前**读挂单基线 | `replace_char_orders` 是整表覆盖（T6）：同步之后再读就只剩新快照自己，而 ③ 的回填匹配要的正是"成交前那一轮"的挂单 —— 拿新快照去匹配，成交掉的单已经不在里面，一笔都对不上，且不报错（P4） |
+/// | ② | 同步（本轮唯一一次网络调用） | `journal_cursor` 在 **fetch 时**就推进了（T7），journal 只回溯 30 天 |
+/// | ③ | 同步一返回**立刻**消费 journal 真值 | journal 是 **at-most-once**：游标已推进、v6 没有 journal 表，这一轮没抽进内存的条目下一轮再也拿不回来。放在任何可失败步骤之后，"消费"就可能永远不发生（P3） |
+/// | ④ | 快照没刷新 → 到此为止 | 数据不可用 ≠ 状态变了（M4b 生命周期的同一教训）：拿旧快照重新判定会凭空造出"还在亏"，也会把真在亏的行误清成"周期结束" |
+/// | ⑤ | 读判定原料 → 跑三个纯判定 | 流水必须是 **90 天窗口全量**（`load_char_tx(id, None)`）：喂本轮增量切片会让每笔卖出都"有卖无买"落进 `Unknown`，形态 ③ 随之静默停产（P5） |
+/// | ⑥ | 状态机 → 闸门 → 落库 → 派发 | 落库在派发之前（P2：本地中心的"投递"就是那一行的存在，顺序反了会留下假的 `local: Sent`）；闸门用合体入口 `can_push_in` 且喂**整个** `alerts` 集合（P7：日限是全局闸，不是每轮闸） |
+///
+/// `Ok(None)` = 这一轮没有可判定的事实（挂单快照没刷新）—— 与 `lifecycle::update_round`
+/// 在没有市场快照时回 `None` 同形。**它不是一个错误**：调用方静默跳过即可。
+pub async fn update_round(
+    db: &Db,
+    client: &EsiClient,
+    token: &str,
+    char_id: u64,
+    backfill_days: i64,
+    channels: &[&dyn PushChannel],
+    now: i64,
+) -> crate::error::Result<Option<AlertRoundReport>> {
+    // ① 同步前的挂单基线：只服务 ③ 的回填匹配（见上表第一行）。
+    let baseline = db.load_char_orders(char_id)?;
+
+    // ② 同步。回填窗走配置（`sync_character` 的签名里没有它，T7 因此补了 `_with` 版）。
+    // 令牌只在这一条链上传，不进日志、不进错误串（Global Constraint）。
+    let sync = sync_character_with(client, token, db, char_id, now, backfill_days).await?;
+
+    // ③ journal 真值的消费点：抽成两张内存字典，此后判定侧不再回头读 slice。
+    // 它必须紧跟同步 —— 上面那一步之后、下面任何一步之前（P3）。
+    let (tax_by_tx, broker_by_order) = journal_truth(&sync.journal_entries);
+
+    // ④ 挂单快照本轮没刷新（403/断网/解析失败）：这一轮没有可判定的事实。
+    // 这一步之前不做任何写 —— 旧快照既不能当"当前挂单"判 ①②，也不能当"本轮命中"判清态。
+    if !sync.orders.ok {
+        tracing::warn!(
+            char_id,
+            reason = %sync.orders.error.as_deref().unwrap_or("未说明"),
+            "角色挂单快照本轮未刷新：跳过本轮的告警判定与收尾，不用旧快照重新记账"
+        );
+        return Ok(None);
+    }
+
+    // ⑤ 判定原料。三样都是本地读：同步后的挂单快照（①② 的判定面）、90 天全量流水（③ 的成本）、
+    // 本地盘口（② 的可执行卖出净额）。费率取面板那一份 —— 预期轨随技能重算，已实现轨不吃它。
+    let orders = db.load_char_orders(char_id)?;
+    let txs = db.load_char_tx(char_id, None)?;
+    let costs = fifo_costs(&txs);
+    // 本地盘口**空着不算"这一轮不能跑"**：它只让 ② 无处可判（`detect_buy_trap` 找不到本站盘
+    // 就跳过那一张），而 ①（挂价 vs 自己的成本）与 ③（成交 vs journal 真值）根本不看市场盘口。
+    // 拿"市场快照为空"当整轮的门，会把一个刚登录、还没跑过 T1 的用户的手上亏损全压掉。
+    let books = db.load_books()?;
+    let fees = db.get_flip_params()?.fees;
+    let names = names_for(db, &orders, &txs)?;
+
+    let mut hits: Vec<AlertPayload> = Vec::new();
+    hits.extend(detect_expected_sell(&orders, &costs, &fees, &broker_by_order, &names, now));
+    hits.extend(detect_buy_trap(&orders, &books, &fees, &broker_by_order, &names, now));
+    // ③ 用**同步前**的基线做回填匹配（① 那一步读的那份），不是上面这份新快照。
+    hits.extend(detect_realized_with(&txs, &baseline, &tax_by_tx, &broker_by_order, &names, now));
+
+    // ⑥ 状态机与闸门。`all` 是**整个** alerts 集合（含本轮没命中的、Cleared 的）：
+    // 当日额度是全局闸，只看本轮命中那几条会把"≤5 条/日"降级成"≤5 条/轮"，且不报错（P7）。
+    // 索引只为把本轮的新行原位并进集合，让后面的条目看得见前面已经吃掉的额度。
+    let mut all = db.load_alerts()?;
+    let mut at: HashMap<String, usize> = all
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.alert_key.clone(), i))
+        .collect();
+    let today = day_key(now);
+    let mut rep = AlertRoundReport {
+        synced: sync.orders.rows + sync.transactions.rows + sync.journal.rows + sync.skills.rows,
+        detected: hits.len(),
+        ..Default::default()
+    };
+
+    for p in &hits {
+        let key = p.alert_key.clone();
+        // 同一 key 一轮内只会出现一次：①② 在同一张快照上按方向互斥，③ 的键带 `tx:` 前缀。
+        let mut rec = match at.get(&key).map(|&i| all[i].clone()) {
+            // 首次转负：唯一构造处（没有基线行时状态机刻意不造空壳行，见 `tick_alert`）。
+            None => AlertRecord::from_payload(p, char_id, now),
+            Some(prev) => {
+                let mut r = tick_alert(Some(&prev), true, now).expect("有基线行就有迁移");
+                // 本轮观测只刷"看到的数"，状态机字段与通知史一列不动（T9 的 `observe`）。
+                r.observe(p, now);
+                r
+            }
+        };
+        let slot = match at.get(&key) {
+            Some(&i) => {
+                all[i] = rec.clone();
+                i
+            }
+            None => {
+                all.push(rec.clone());
+                at.insert(key, all.len() - 1);
+                all.len() - 1
+            }
+        };
+
+        let allowed = can_push_in(&all, &rec, now, &today);
+
+        // **落库在派发之前**（P2）：本地提醒中心的"投递"就是这一行本身（`LocalChannel` 恒回
+        // `Sent` 且自己不写任何东西）—— 顺序反了，`save_alert` 一失败就留下一条假的
+        // `local: Sent`，用户看着推送成功、提醒中心却是空的。
+        db.save_alert(&rec)?;
+        if !allowed {
+            rep.suppressed += 1;
+            continue;
+        }
+
+        let outcomes = dispatch(channels, p).await;
+        // P8：`dispatch` 今天是**串行**的（T11 的接口就长这样），所以 n 条通道最坏 n×15 s
+        // （单次推送的总超时）都堆在同一个调度轮里。本轮不改它（要动 T11 的接口），只记在这：
+        // 通道数真涨上去时，这段墙钟是第一个要看的数。
+        // 记账口径（T9）：至少一条通道确认收到才算"推过"。本地那条恒 `Sent`（spec §4.5 的
+        // 回落方案），于是实践中"过闸即记账"；真的一条通道都没有时这一条不记账、下一轮重来
+        // —— 方向是宁可重复，不可全丢。
+        if outcomes.iter().any(|o| matches!(o, PushOutcome::Sent)) {
+            mark_pushed(&mut rec, now, &today);
+            // 通知史与当日额度从这里推进：下一轮的闸门读的就是这一行。
+            db.save_alert(&rec)?;
+            all[slot] = rec;
+            rep.pushed += 1;
+        }
+    }
+
+    // 本轮没命中的行 = 亏损消失（撤单 / 盘口回来 / 判定面移出）：`tick_alert` 用 fired=false
+    // 把周期收尾成 `Cleared` —— 行、payload 与通知史全留（提醒中心不受限额，spec §4.4）。
+    // 这一段的前提是上面那条快照检查：拿没刷新的快照跑收尾，会把"还在亏"误标成"周期结束"。
+    let hit_keys: HashSet<&str> = hits.iter().map(|p| p.alert_key.as_str()).collect();
+    let mut cleared = 0usize;
+    for r in all
+        .iter()
+        .filter(|r| r.state != AlertState::Cleared && !hit_keys.contains(r.alert_key.as_str()))
+    {
+        if let Some(next) = tick_alert(Some(r), false, now) {
+            db.save_alert(&next)?;
+            cleared += 1;
+        }
+    }
+    if cleared > 0 {
+        tracing::info!("告警周期收尾：{cleared} 条转「已清」（行与通知史留着）");
+    }
+
+    Ok(Some(rep))
+}
+
+/// 自然日键（UTC，`YYYY-MM-DD`）：T9 的 `notified_day` 与它比较，跨天自然归零。
+/// 时间戳推不出日期时给空串 —— 它不与任何已记下的 `notified_day` 相等，于是当日用量算 0
+/// （方向是**少推**，不会误推）。
+fn day_key(now: i64) -> String {
+    chrono::DateTime::from_timestamp(now, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// 名字字典的装配：只查判定面真的用得到的 id（挂单与流水的类型 / 站点），逐条走 DB 的
+/// 单条查询。查不到**不填**，由 [`NameLookup`] 的 fallback 串顶上
+/// （`type_id N` / `站点 #N`，与 `flip_scan` 同一套字面量）—— 名字缺失不该杀掉一张卡。
+fn names_for(db: &Db, orders: &[CharOrder], txs: &[WalletTx]) -> crate::error::Result<NameLookup> {
+    let type_ids: HashSet<u32> = orders
+        .iter()
+        .map(|o| o.type_id)
+        .chain(txs.iter().map(|t| t.type_id))
+        .collect();
+    let locations: HashSet<u64> = orders
+        .iter()
+        .map(|o| o.location_id)
+        .chain(txs.iter().map(|t| t.location_id))
+        .collect();
+
+    let mut types = HashMap::new();
+    for id in type_ids {
+        if let Some(name) = db.type_name(id)? {
+            types.insert(id, name);
+        }
+    }
+    let mut stations = HashMap::new();
+    for id in locations {
+        if let Some(name) = db.station_name(id)? {
+            stations.insert(id, name);
+        }
+    }
+    Ok(NameLookup { types, stations })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::char::fifo::{fifo_costs, CostSource};
+    use crate::config::EsiConfig;
     use crate::market::{PriceLevel, STATION_JITA};
+    use crate::push::LocalChannel;
     use crate::store::Db;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
 
     const TYPE: u32 = 34;
 
@@ -1354,5 +1599,330 @@ mod tests {
         let back: AlertPayload = serde_json::from_str(&serde_json::to_string(&trap[0]).unwrap()).unwrap();
         assert_payload_equivalent(&back, &trap[0]);
         assert_eq!(back.kind, AlertKind::BuyOrderTrap);
+    }
+
+    // ---- 装配：一轮真的走完（真 socket 桩 → 真同步 → 真判定 → 真落库 → 真派发）------
+
+    /// 桩服务：按 URL 片段逐条回 200 + body，未命中一律 404；共收 `requests` 条。
+    /// 形状照 `char.rs` 的 `char_stub`，去掉"路由用掉即移除"与 `Last-Modified`
+    /// —— 这两条测试各只跑一轮。
+    fn esi_stub(routes: Vec<(&'static str, &'static str)>, requests: usize) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..requests {
+                // 请求没来（实现回归了）时别把测试挂死：超时就收摊，断言侧会看到账目对不上。
+                let Ok(Some(req)) = server.recv_timeout(std::time::Duration::from_secs(10)) else {
+                    return;
+                };
+                let url = req.url().to_string();
+                let hit = routes.iter().find(|(frag, _)| url.contains(frag));
+                let resp = match hit {
+                    Some((_, body)) => tiny_http::Response::from_string(*body).with_status_code(200),
+                    None => tiny_http::Response::from_string(r#"{"error":"not found"}"#)
+                        .with_status_code(404),
+                };
+                let _ = req.respond(resp);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn client_at(base_url: String) -> EsiClient {
+        EsiClient::new(EsiConfig {
+            base_url,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// 派发通道的测试替身：记下收到的载荷，并回一个测试指定的结果（照 `push.rs` 的 `Spy`）。
+    ///
+    /// **为什么不是"通道里查一次库"**：`rusqlite::Connection` 是 `Send + !Sync`，`Db` 因此
+    /// 不是 `Sync`，装不进 `PushChannel`（那要求 `Send + Sync`）。顺序证据改用结果本身来取：
+    /// 通道回**非 `Sent`** 时，若实现是"先派发、成功才落库"，提醒中心里就一行都没有 ——
+    /// 断言"行在表里"于是恰好钉住了"落库在派发之前"。
+    struct SpyChannel {
+        outcome: PushOutcome,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PushChannel for SpyChannel {
+        fn name(&self) -> &'static str {
+            "spy"
+        }
+
+        fn send<'a>(
+            &'a self,
+            p: &'a AlertPayload,
+        ) -> Pin<Box<dyn Future<Output = PushOutcome> + Send + 'a>> {
+            let key = p.alert_key.clone();
+            let (outcome, seen) = (self.outcome.clone(), Arc::clone(&self.seen));
+            Box::pin(async move {
+                seen.lock().unwrap().push(key);
+                outcome
+            })
+        }
+    }
+
+    /// 90 天窗内的一笔买入：FIFO 成本 100/件（① 的成本基准）。
+    fn seed_buy(db: &Db) {
+        db.upsert_char_tx(
+            90_000_001,
+            &[WalletTx {
+                transaction_id: 1,
+                date: "2026-09-10T00:00:00Z".to_string(),
+                type_id: TYPE,
+                location_id: STATION_JITA,
+                is_buy: true,
+                unit_price: 100.0,
+                quantity: 100,
+            }],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_round_persists_the_alert_before_it_dispatches() {
+        // P2 的集成测试：真 socket 桩 → 真同步 → 真判定 → 真落库 → 真派发。
+        // 断言的是控制器点名的那件事：**回合结束后 `alerts` 行确实在表里** —— 本地提醒中心的
+        // "投递"就是这一行（`LocalChannel` 恒回 `Sent` 且自己不写任何东西），只接派发不接落库
+        // 就会拿到一个"推送成功、提醒中心空表"的假成功。
+        let db = Db::in_memory().unwrap();
+        seed_buy(&db);
+        // 挂 90 卖单 100 件对成本 100：按默认面板（A0，税 7.5%）净额 83.25 < 100 → ① 命中。
+        const ORDERS: &str = r#"[{"order_id":101,"type_id":34,"location_id":60003760,
+            "is_buy_order":false,"price":90.0,"volume_remain":100,"issued":"2026-09-20T10:00:00Z",
+            "duration":90}]"#;
+        let client = client_at(esi_stub(vec![("/orders/", ORDERS)], 4));
+        let local = LocalChannel::new();
+        let chans: [&dyn PushChannel; 1] = [&local];
+
+        let rep = update_round(&db, &client, "SECRET-ACCESS-TOKEN", 90_000_001, 90, &chans, now())
+            .await
+            .unwrap()
+            .expect("挂单快照刷新过 → 这一轮必须跑");
+
+        assert_eq!(rep.synced, 1, "只有挂单端点拿到了东西（其余三个端点 404）");
+        assert_eq!(rep.detected, 1, "挂卖单 90 对成本 100：① 命中");
+        assert_eq!((rep.pushed, rep.suppressed), (1, 0));
+
+        let rows = db.load_alerts().unwrap();
+        assert_eq!(rows.len(), 1, "提醒中心的原料是这张表：{rows:?}");
+        assert_eq!(rows[0].alert_key, "order:101");
+        assert_eq!(rows[0].kind, AlertKind::ExpectedSellLoss);
+        assert_eq!(rows[0].state, AlertState::Notified, "收到 Sent 才记账（T9 的 mark_pushed）");
+        assert_eq!(rows[0].notified_day.as_deref(), Some("2026-09-24"), "自然日按 UTC 记");
+        assert!(rows[0].payload.contains("\"alert_key\":\"order:101\""), "{}", rows[0].payload);
+    }
+
+    #[tokio::test]
+    async fn a_retryable_push_still_leaves_the_row_and_does_not_spend_the_quota() {
+        // 两条契约在这一条测试里同时被钉住：
+        // ① **落库在派发之前**（P2）。通道回非 `Sent` 时，若实现是"先派发、成功才落库"，
+        //    提醒中心里就一行都没有 —— 所以"行在表里"这个断言本身就是顺序证据。
+        // ② **只对 `Sent` 记账**（T9 的 mark_pushed）：`Retry` 不算推过，冷却与当日额度不动，
+        //    下一轮还会再来（方向是宁可重复，不可全丢）。
+        let db = Db::in_memory().unwrap();
+        seed_buy(&db);
+        const ORDERS: &str = r#"[{"order_id":101,"type_id":34,"location_id":60003760,
+            "is_buy_order":false,"price":90.0,"volume_remain":100,"issued":"2026-09-20T10:00:00Z",
+            "duration":90}]"#;
+        let client = client_at(esi_stub(vec![("/orders/", ORDERS)], 4));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let spy = SpyChannel {
+            outcome: PushOutcome::Retry {
+                retry_after_secs: 30,
+                reason: "桩：限流".into(),
+            },
+            seen: Arc::clone(&seen),
+        };
+        let chans: [&dyn PushChannel; 1] = [&spy];
+        let rep = update_round(&db, &client, "SECRET-ACCESS-TOKEN", 90_000_001, 90, &chans, now())
+            .await
+            .unwrap()
+            .expect("挂单快照刷新过 → 这一轮必须跑");
+
+        assert_eq!(rep.detected, 1);
+        assert_eq!(
+            (rep.pushed, rep.suppressed),
+            (0, 0),
+            "派发过但没有通道确认：既不算推成功，也不是被闸门拦下"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["order:101".to_string()],
+            "这一条确实被派发过（否则上面的'行在表里'说明不了顺序）"
+        );
+
+        let rows = db.load_alerts().unwrap();
+        assert_eq!(rows.len(), 1, "远端推失败 ≠ 提醒中心没有这条（先落库、再派发）");
+        assert_eq!(rows[0].state, AlertState::New, "没有 Sent → 不记账");
+        assert_eq!(rows[0].notified_at, None, "冷却与日限都不该推进");
+        assert_eq!(rows[0].notified_count_day, 0);
+    }
+
+    #[tokio::test]
+    async fn a_realized_loss_uses_the_journal_it_just_fetched_and_the_pre_sync_baseline() {
+        // P3 + P4 的集成测试：journal 是 at-most-once 的（游标在 fetch 时推进、v6 没有 journal 表），
+        // 所以形态 ③ 的原料只能来自**本轮**同步回来的那批日记账；而它的回填匹配又要用**同步前**
+        // 那张挂单快照（成交掉的单在新快照里已经不存在了）。
+        // 两个错误实现都会在这条测试上现形：不喂 journal → detected 0；拿同步后的快照匹配 → order_id 0。
+        let db = Db::in_memory().unwrap();
+        seed_buy(&db);
+        // 上一轮的挂单快照：这张卖单在本轮之前就被吃掉了（下面 orders 端点回的是空表）。
+        db.replace_char_orders(
+            90_000_001,
+            &[CharOrder {
+                order_id: 555,
+                type_id: TYPE,
+                location_id: STATION_JITA,
+                is_buy: false,
+                price: 90.0,
+                volume_remain: 100,
+                issued: "2026-09-15T00:00:00Z".to_string(),
+                duration: 90,
+                fetched_at: ts("2026-09-20T00:00:00Z"),
+            }],
+            ts("2026-09-20T00:00:00Z"),
+        )
+        .unwrap();
+
+        // 本轮的三条响应：挂单空（那张单成交掉了）、流水带出这笔卖出、日记账带出实付真值。
+        const TXS: &str = r#"[{"transaction_id":2,"date":"2026-09-20T00:00:00Z","type_id":34,
+            "location_id":60003760,"is_buy":false,"unit_price":90.0,"quantity":100}]"#;
+        const JOURNAL: &str = r#"[{"id":9001,"date":"2026-09-20T00:00:01Z","ref_type":"transaction_tax",
+            "amount":-300.0,"context_id":2,"description":"Transaction Tax"},
+            {"id":9002,"date":"2026-09-20T00:00:02Z","ref_type":"brokers_fee",
+            "amount":-270.0,"context_id":555,"description":"Broker Fee"}]"#;
+        let client = client_at(esi_stub(
+            vec![("/orders/", "[]"), ("/transactions/", TXS), ("/journal/", JOURNAL)],
+            4,
+        ));
+
+        let local = LocalChannel::new();
+        let chans: [&dyn PushChannel; 1] = [&local];
+        let rep = update_round(&db, &client, "SECRET-ACCESS-TOKEN", 90_000_001, 90, &chans, now())
+            .await
+            .unwrap()
+            .expect("挂单快照刷新过（空表也是刷新）→ 这一轮要跑");
+
+        assert_eq!(rep.detected, 1, "这笔卖出：9000 − 300 − 10000 − 270 = −1570");
+        let rows = db.load_alerts().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].alert_key, "tx:2", "已实现轨的键是 transaction_id");
+        assert_eq!(rows[0].kind, AlertKind::RealizedLoss);
+        let p: AlertPayload = serde_json::from_str(&rows[0].payload).unwrap();
+        assert_eq!(
+            p.order_id, 555,
+            "回填匹配必须用同步**之前**那张快照：拿同步后的空表匹配会得到 0"
+        );
+        assert!((p.loss_isk - 1570.0).abs() < 1e-9, "实得 {}", p.loss_isk);
+        assert!(
+            p.caliber.formula.contains("300") && p.caliber.formula.contains("270"),
+            "公式串要带上本轮 journal 里那两个真值：{}",
+            p.caliber.formula
+        );
+    }
+
+    #[tokio::test]
+    async fn the_daily_cap_is_the_whole_alerts_set_not_this_round() {
+        // P7：当日额度是**全局**闸（spec §4.4「每日 ≤5 条」）。只喂"本轮命中"那几条，全局闸
+        // 就退化成"每轮 ≤5 条"且不报错 —— 这条测试先让今天的额度在**别的条目**上用完，
+        // 再看第 6 条（它自己从没推过，单条目闸门必然放行）会不会被合体闸门拦下。
+        let db = Db::in_memory().unwrap();
+        seed_buy(&db);
+        let today = "2026-09-24";
+        let filler: Vec<CharOrder> = (8001..=8005).map(|id| order(id, false, 90.0, 100)).collect();
+        for p in detect_expected_sell(
+            &filler,
+            &cost_known(95.0),
+            &fees_a5(),
+            &HashMap::new(),
+            &NameLookup::default(),
+            now(),
+        ) {
+            let mut rec = AlertRecord::from_payload(&p, 90_000_001, now() - 60);
+            mark_pushed(&mut rec, now() - 60, today); // 今天就推过这 5 条
+            db.save_alert(&rec).unwrap();
+        }
+        assert_eq!(
+            day_entries_used(&db.load_alerts().unwrap(), today),
+            ALERT_DAILY_CAP,
+            "夹具前提：今天的额度已经满了"
+        );
+
+        const ORDERS: &str = r#"[{"order_id":101,"type_id":34,"location_id":60003760,
+            "is_buy_order":false,"price":90.0,"volume_remain":100,"issued":"2026-09-20T10:00:00Z",
+            "duration":90}]"#;
+        let client = client_at(esi_stub(vec![("/orders/", ORDERS)], 4));
+        let local = LocalChannel::new();
+        let chans: [&dyn PushChannel; 1] = [&local];
+        let rep = update_round(&db, &client, "SECRET-ACCESS-TOKEN", 90_000_001, 90, &chans, now())
+            .await
+            .unwrap()
+            .expect("挂单快照刷新过 → 这一轮要跑");
+
+        assert_eq!(
+            (rep.detected, rep.pushed, rep.suppressed),
+            (1, 0, 1),
+            "第 6 条被当日全局闸拦下（只接单条目闸门的实现会把它推出去）"
+        );
+        let rows = db.load_alerts().unwrap();
+        assert_eq!(rows.len(), 6, "拦下 ≠ 丢弃：这一条照样进提醒中心");
+        let fresh = rows.iter().find(|r| r.alert_key == "order:101").expect("新条目要在表里");
+        assert_eq!(fresh.state, AlertState::New, "没推成就没有通知史");
+        assert_eq!(fresh.notified_at, None);
+        assert_eq!(
+            day_entries_used(&rows, today),
+            ALERT_DAILY_CAP,
+            "已清的条目仍占着当天的额度（本轮那 5 条已转 Cleared）"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.state == AlertState::Cleared).count(),
+            5,
+            "本轮没再命中的 5 条收尾成已清"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_round_clears_the_alerts_it_no_longer_sees() {
+        // 本轮没命中的行 = 亏损消失（撤单 / 盘口回来 / 判定面移出）：`tick_alert` 走 fired=false
+        // 把周期收尾成 `Cleared` —— 行、payload 与通知史全留（提醒中心不受限额，spec §4.4）。
+        let db = Db::in_memory().unwrap();
+        seed_buy(&db);
+        // 一条上一轮留下的告警：它对应的挂单已经撤了（下面 orders 端点回空表）。
+        let stale = order(7001, false, 90.0, 100);
+        let hits = detect_expected_sell(
+            std::slice::from_ref(&stale),
+            &cost_known(95.0),
+            &fees_a5(),
+            &HashMap::new(),
+            &NameLookup::default(),
+            now(),
+        );
+        let mut rec = AlertRecord::from_payload(&hits[0], 90_000_001, now() - 3600);
+        mark_pushed(&mut rec, now() - 3600, "2026-09-24");
+        db.save_alert(&rec).unwrap();
+
+        let client = client_at(esi_stub(vec![("/orders/", "[]")], 4));
+        let local = LocalChannel::new();
+        let chans: [&dyn PushChannel; 1] = [&local];
+        let rep = update_round(&db, &client, "SECRET-ACCESS-TOKEN", 90_000_001, 90, &chans, now())
+            .await
+            .unwrap()
+            .expect("快照刷新过 → 这一轮要跑");
+
+        assert_eq!((rep.detected, rep.pushed, rep.suppressed), (0, 0, 0));
+        let rows = db.load_alerts().unwrap();
+        assert_eq!(rows.len(), 1, "周期结束不是删除");
+        assert_eq!(rows[0].state, AlertState::Cleared);
+        assert_eq!(rows[0].notified_at, Some(now() - 3600), "通知史跨周期保留");
+        assert!(
+            rows[0].payload.contains("order:7001"),
+            "清掉亏损态不丢 payload：{}",
+            rows[0].payload
+        );
     }
 }

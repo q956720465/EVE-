@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use futures::stream::{self, StreamExt};
 use tokio::sync::watch;
 
+use crate::alert::{self, AlertRoundReport};
+use crate::config::CharConfig;
 use crate::error::{Error, Result};
 use crate::esi::EsiClient;
 use crate::market::{
@@ -19,10 +21,20 @@ use crate::market::{
     history::{self, HistoryConfig, PassReport},
     hub_pool, LocationKind, RoundOutcome, STATION_JITA,
 };
+use crate::push::{PushChannel, PushConfig};
+use crate::sso::store::{KeyringTokenStore, TokenStore};
 use crate::store::{Db, HistoryTarget, RoundRecord};
 
 /// 300 s 缓存下限 + 60 s 余量。低于 300 s 即绕过缓存，代码层面拦住。
 pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// 令牌在系统凭据库里的服务名与条目名（唯一一份字面量）。
+///
+/// **T13 的登录与登出必须用同一对**：登录把令牌写进 (`KEYRING_SERVICE`, `KEYRING_ACCOUNT`)，
+/// 同步回合从这里读 —— 两边各指一条条目时，用户"已经登录成功"而每一轮都静默跳过（没令牌
+/// 不是错误，见 [`Scheduler::run_char_and_alerts`]），从现象上完全看不出是条目没对上。
+pub const KEYRING_SERVICE: &str = "EveMarketDesk";
+pub const KEYRING_ACCOUNT: &str = "eve-sso";
 
 /// T1.5 跨区补拉配置（方案 v3.1 §3.1：隔轮 ≈12 min；默认启用）。
 #[derive(Debug, Clone)]
@@ -68,6 +80,8 @@ pub struct SchedulerConfig {
     pub history: HistoryConfig,
     /// T1.5 跨区补拉（§3.1 隔轮 / §4.1 三枢纽）。
     pub xregion: XRegionConfig,
+    /// M4c 角色挂链与亏损提醒（§4.1 / §4.2）。
+    pub char: CharConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -81,6 +95,12 @@ impl Default for SchedulerConfig {
             // 默认值刻意不走 `from_env`：环境变量是运行期配置，测试不能被它左右。
             history: HistoryConfig::default(),
             xregion: XRegionConfig::default(),
+            // M4c 同一条纪律：默认**关闭**（没配 `client_id` 之前，任何一轮都不该往外发请求）。
+            // `EMD_CHAR_SYNC` 的归一在 `CharConfig::from_env()` 一处 —— 本文件不读第二个 env：
+            // `EMD_XREGION` 那次归一修的是"serve 绕过了 from_env"，而 char 侧默认本就是关的，
+            // 要开必须显式传 `CharConfig`（多读一次 env 会让测试的成败取决于同一进程里
+            // 别的测试有没有在改环境变量）。
+            char: CharConfig::default(),
         }
     }
 }
@@ -126,6 +146,9 @@ pub struct Scheduler {
     client: Arc<EsiClient>,
     db: Arc<Db>,
     cfg: SchedulerConfig,
+    /// 令牌来源（M4c）。默认系统凭据库；测试与登录路径可注入
+    /// （[`Scheduler::with_tokens`]）—— 这条通路上**没有**任何令牌的落库/日志面。
+    tokens: Arc<dyn TokenStore>,
     status: watch::Sender<RoundState>,
     state: watch::Receiver<RoundState>,
 }
@@ -150,9 +173,17 @@ impl Scheduler {
             client,
             db,
             cfg,
+            tokens: Arc::new(KeyringTokenStore::new(KEYRING_SERVICE, KEYRING_ACCOUNT)),
             status: tx,
             state: rx,
         }
+    }
+
+    /// 换一个令牌来源。测试用内存实现，登录路径（T13/T14）可以传自己那份 ——
+    /// 凭据库打不开的环境里不该连"读一下试试"都做不到。
+    pub fn with_tokens(mut self, tokens: Arc<dyn TokenStore>) -> Self {
+        self.tokens = tokens;
+        self
     }
 
     pub fn subscribe(&self) -> watch::Receiver<RoundState> {
@@ -280,6 +311,25 @@ impl Scheduler {
                     ),
                     Ok(None) => {}
                     Err(e) => tracing::warn!("机会生命周期结算失败：{e}"),
+                }
+            }
+
+            // M4c：角色同步与亏损告警回合，与 T1 节拍同频（每轮一次，≤4 个角色请求 + 若干推送）。
+            // 位置在生命周期之后、T3 之前：判定吃的是**刚落地的这一轮盘口**（② 的可执行卖出净额），
+            // 而 T3 是每日一次的大头，放它后面只会让告警的数据年龄多等几分钟。
+            // 纪律与上面两个钩子相同：`outcome.is_ok()` 才跑（轮失败时不拿旧盘口判定/收尾）、
+            // 失败只 warn 不打断主循环 —— 告警取不到数不是停采的理由，下一轮还会再来。
+            if outcome.is_ok() {
+                match self.run_char_and_alerts().await {
+                    Ok(Some(rep)) => tracing::info!(
+                        "角色告警回合：同步 {} 行 / 判定 {} 条 / 推送 {} 条 / 拦下 {} 条",
+                        rep.synced,
+                        rep.detected,
+                        rep.pushed,
+                        rep.suppressed
+                    ),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("角色告警回合未完成：{e}"),
                 }
             }
 
@@ -508,6 +558,46 @@ impl Scheduler {
         Ok(Some(rep))
     }
 
+    /// 一轮角色同步 + 亏损告警（M4c）。真的同步与判定在 [`alert::update_round`]（那侧的
+    /// 步骤顺序是契约）；这里只做三件事：**开门条件**、令牌 → 角色身份、通道装配。
+    ///
+    /// `Ok(None)` 的三种形态都是"这一轮没有能跑的回合"，**都不是错误**（静默跳过）：
+    /// ① 配置没启用（`EMD_CHAR_SYNC=0` 的语义由 `CharConfig.enabled` 承载，见 `SchedulerConfig`）；
+    /// ② 凭据库没有令牌 —— `TokenStore::load` 的 `Ok(None)` 覆盖"没登录 / 已登出 / 凭据库
+    ///    打不开 / 内容坏了"四种情形，它们都不该让主循环当成故障；
+    /// ③ 同步没拿到挂单快照（见 `alert::update_round` 的第 ④ 步）。
+    ///
+    /// 令牌只在本函数的调用链上流转：不进日志、不进错误串、不落库（Global Constraint）。
+    /// 它过期时这里**不刷新**（刷新编排不在 T12 的边界内，T2 只给了请求体构造）：四端点会
+    /// 整轮 401 → ③ 那一支 warn 出"快照未刷新"并跳过这一轮，不静默、也不半推。
+    pub async fn run_char_and_alerts(&self) -> Result<Option<AlertRoundReport>> {
+        // ① 开关与令牌都在最前面：关着的时候连凭据库都不碰（"关"= 彻底不与外界交互）。
+        if !self.cfg.char.enabled {
+            return Ok(None);
+        }
+        let Some(tokens) = self.tokens.load()? else {
+            return Ok(None);
+        };
+        // 角色身份从**令牌自己**里取（T3B 的纯函数，只解码不验签）：角色 id 必须与这个
+        // 令牌同源 —— 让"库里恰好有哪一行 char_meta"来决定同步谁，就是拿 A 的令牌去拉 B 的
+        // 订单，而 `fetch_auth` 的缓存键正是 URL 里的这个 id。
+        let (char_id, _name) = crate::sso::flow::char_from_access_token(&tokens.access_token)?;
+        // 通道按配置拼装（P9）：关掉的 / 没填 webhook 的钉钉通道根本不进场，于是"推送关着"
+        // 就等于"只判定、只落本地提醒中心"；本地那条恒在（spec §4.5 的回落方案）。
+        let channels = PushConfig::load(&self.db)?.channels();
+        let refs: Vec<&dyn PushChannel> = channels.iter().map(|c| c.as_ref()).collect();
+        alert::update_round(
+            &self.db,
+            &self.client,
+            &tokens.access_token,
+            char_id,
+            self.cfg.char.backfill_days,
+            &refs,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+    }
+
     fn consecutive_failures(&self) -> Result<usize> {
         let mut stmt = self.db.conn().prepare(
             "SELECT status FROM round_log ORDER BY id DESC LIMIT 10",
@@ -710,6 +800,9 @@ mod tests {
         assert!(c.xregion.enabled);
         assert_eq!(c.xregion.candidate_top, 200);
         assert_eq!(c.xregion.targets, market::XREGION_TARGETS);
+        // M4c：角色挂链与亏损提醒默认关闭、首启回填 90 天（与 `CharConfig` 的默认同源）。
+        assert!(!c.char.enabled, "没配 client_id 之前，任何一轮都不该往外发请求");
+        assert_eq!(c.char.backfill_days, 90);
     }
 
     #[tokio::test]
@@ -890,5 +983,245 @@ mod tests {
         assert_eq!(c.candidate_top, 200);
         assert_eq!(c.targets, market::XREGION_TARGETS);
         assert_eq!(c.max_age_secs, market::XREGION_MAX_AGE_SECS);
+    }
+
+    // ---- M4c：角色同步与告警钩子（与 T1 节拍同频；数据不可用 ≠ 状态变了）----------
+
+    use crate::alert::{detect_expected_sell, AlertRecord, AlertPayload, NameLookup};
+    use crate::char::fifo::{CostSource, FifoCost};
+    use crate::config::EsiConfig;
+    use crate::market::FeeModel;
+    use crate::sso::store::TokenStore;
+    use crate::sso::token::TokenSet;
+    use crate::store::CharOrder;
+    use base64::Engine as _;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const CHAR_ID: u64 = 90_000_001;
+    /// 判定基准：2026-09-21T14:13:20Z（自然日是 2026-09-21）。
+    const T0: i64 = 1_790_000_000;
+
+    /// 令牌存储的探针：记下 `load` 被调了几次 —— "配置关着时连凭据库都不碰"这条断言
+    /// 只有它能提供证据（内存实现自己看不出这点）。
+    #[derive(Default)]
+    struct SpyStore {
+        loads: AtomicUsize,
+        token: Option<TokenSet>,
+    }
+
+    impl SpyStore {
+        /// 造一个能被 `char_from_access_token` 解析的三段式 JWT（它只解码第二段，不验签）。
+        fn with_token(char_id: u64) -> Self {
+            Self {
+                loads: AtomicUsize::new(0),
+                token: Some(TokenSet {
+                    access_token: jwt(char_id),
+                    refresh_token: "REFRESH-TOKEN".into(),
+                    expires_at: i64::MAX,
+                }),
+            }
+        }
+
+        fn loads(&self) -> usize {
+            self.loads.load(Ordering::Relaxed)
+        }
+    }
+
+    impl TokenStore for SpyStore {
+        fn load(&self) -> Result<Option<TokenSet>> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.token.clone())
+        }
+        fn save(&self, _t: &TokenSet) -> Result<()> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn jwt(char_id: u64) -> String {
+        let claims = serde_json::json!({
+            "sub": format!("CHARACTER:EVE:{char_id}"),
+            "name": "Pilot One",
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        format!("hdr.{payload}.sig")
+    }
+
+    fn enabled_cfg(enabled: bool) -> SchedulerConfig {
+        SchedulerConfig {
+            char: CharConfig {
+                client_id: "client-id".into(),
+                enabled,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// 一条挂单轨的载荷（只用来种告警行；`detect_expected_sell` 自己会判"亏没亏"）。
+    fn payload_for(order_id: i64) -> AlertPayload {
+        let o = CharOrder {
+            order_id,
+            type_id: 34,
+            location_id: STATION_JITA,
+            is_buy: false,
+            price: 97.0,
+            volume_remain: 100,
+            issued: "2026-09-20T10:00:00Z".to_string(),
+            duration: 90,
+            fetched_at: T0,
+        };
+        let costs = HashMap::from([(
+            34u32,
+            FifoCost {
+                avg_cost: 95.0,
+                source: CostSource::Known,
+            },
+        )]);
+        detect_expected_sell(
+            &[o],
+            &costs,
+            &FeeModel::default(),
+            &HashMap::new(),
+            &NameLookup::default(),
+            T0,
+        )
+        .remove(0)
+    }
+
+    #[tokio::test]
+    async fn char_sync_is_skipped_when_disabled_or_no_token() {
+        let client = Arc::new(EsiClient::new(Default::default()).unwrap());
+        let db = Arc::new(Db::in_memory().unwrap());
+
+        // ① 开关关着（`EMD_CHAR_SYNC=0` 归一出来的就是这个状态）：即便凭据库里有令牌也一动不动，
+        //    连凭据库都不读 —— "关"是彻底不与外界交互，而不是"读了再决定不用"。
+        let off = Arc::new(SpyStore::with_token(CHAR_ID));
+        let sched = Scheduler::new(client.clone(), db.clone(), enabled_cfg(false))
+            .with_tokens(off.clone());
+        assert!(
+            sched.run_char_and_alerts().await.unwrap().is_none(),
+            "关闭 = 静默跳过（不是错误）"
+        );
+        assert_eq!(off.loads(), 0, "关着的时候不该去读凭据库");
+        assert_eq!(client.stats().requests, 0, "关着的时候一个请求都不发");
+        assert!(db.char_meta(CHAR_ID).unwrap().is_none(), "没同步过就不该有挂链行");
+
+        // ② 开着但凭据库没有令牌（没登录 / 已登出 / 凭据库打不开 —— `TokenStore::load` 的契约）：
+        //    同样静默跳过，不报错、不发请求、不留痕。
+        let none = Arc::new(SpyStore::default());
+        let sched = Scheduler::new(client.clone(), db.clone(), enabled_cfg(true))
+            .with_tokens(none.clone());
+        assert!(sched.run_char_and_alerts().await.unwrap().is_none());
+        assert_eq!(none.loads(), 1, "启用时才会去读凭据库");
+        assert_eq!(client.stats().requests, 0, "没有令牌 = 一个请求都不发");
+        assert!(db.char_meta(CHAR_ID).unwrap().is_none());
+
+        // ③ 令牌在、但解析不出角色（凭据库里是别的 subject）：这是**异常**而不是"没登录" ——
+        //    如实上抛，由 `run()` 的钩子 warn 掉（不打断主循环），不静默当成没事。
+        let weird = Arc::new(SpyStore {
+            loads: AtomicUsize::new(0),
+            token: Some(TokenSet {
+                access_token: "hdr.eyJzdWIiOiJVU0VSOjEifQ.sig".into(),
+                refresh_token: "REFRESH-TOKEN".into(),
+                expires_at: i64::MAX,
+            }),
+        });
+        let sched = Scheduler::new(client.clone(), db.clone(), enabled_cfg(true)).with_tokens(weird);
+        assert!(sched.run_char_and_alerts().await.is_err(), "认不出角色要报出来");
+        assert_eq!(client.stats().requests, 0, "解析不出角色就不该发请求");
+    }
+
+    /// 只回 403 的桩服务：四个角色端点全部拿不到东西（令牌过期 / 权限不足 / 断网走的是同一条
+    /// 分支）。用**真**连接而不是"没人听的端口"：实测本机对闭合端口的连接尝试要 ~2 s 才出结果，
+    /// 四个端点就是 8 s，而这条测试盯的只是那一支判断。
+    fn forbidden_stub(requests: usize) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..requests {
+                // 请求没来（实现回归了）时别把测试挂死：超时就收摊，断言侧会看到请求数对不上。
+                let Ok(Some(req)) = server.recv_timeout(std::time::Duration::from_secs(10)) else {
+                    return;
+                };
+                let _ = req.respond(
+                    tiny_http::Response::from_string(r#"{"error":"Forbidden - token expired"}"#)
+                        .with_status_code(403),
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn alert_round_not_run_when_snapshot_is_stale() {
+        // 数据不可用 ≠ 状态变了（与 M4b 生命周期同一教训）：本轮挂单快照没刷新时，既不拿旧快照
+        // 重新判定（会凭空造出"还在亏"），也不把已有的告警收尾成"已清"。
+        // 用桩服务把四个端点全回 403（令牌过期 / 权限不足 / 断网走同一条分支）：这一轮的
+        // `orders.ok == false`，旧快照仍是"最后一份好数据"，但**它不是当前盘口**。
+        let client = Arc::new(
+            EsiClient::new(EsiConfig {
+                base_url: forbidden_stub(4),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let db = Arc::new(Db::in_memory().unwrap());
+
+        // 库里已有上一轮的东西：一张还在旧快照里的挂单、一条挂在它上面的告警行（若这一轮真的跑了，
+        // 它会被观测刷新 —— `last_seen_at` 会变），以及一条对应"已经撤掉的单"的告警行（会被收尾）。
+        db.replace_char_orders(
+            CHAR_ID,
+            &[CharOrder {
+                order_id: 101,
+                type_id: 34,
+                location_id: STATION_JITA,
+                is_buy: false,
+                price: 97.0,
+                volume_remain: 100,
+                issued: "2026-09-20T10:00:00Z".to_string(),
+                duration: 90,
+                fetched_at: 0, // 写入时被 now 覆盖
+            }],
+            T0 - 360,
+        )
+        .unwrap();
+        for order_id in [101i64, 999] {
+            let rec = AlertRecord::from_payload(&payload_for(order_id), CHAR_ID, T0 - 600);
+            db.save_alert(&rec).unwrap();
+        }
+        let before = db.load_alerts().unwrap();
+        assert_eq!(before.len(), 2);
+
+        let store = Arc::new(SpyStore::with_token(CHAR_ID));
+        let sched =
+            Scheduler::new(client.clone(), db.clone(), enabled_cfg(true)).with_tokens(store);
+        assert!(
+            sched.run_char_and_alerts().await.unwrap().is_none(),
+            "快照陈旧 → 这一轮不跑（不判定、不落库、不收尾）"
+        );
+        assert_eq!(
+            client.stats().requests,
+            4,
+            "确实跑了一整趟同步（四个端点各一次；403 不触发重试），不是被别的理由跳过"
+        );
+        assert_eq!(
+            db.load_alerts().unwrap(),
+            before,
+            "一条告警行的任何一个字段都不该被这一轮动过（last_seen_at 变了 = 拿旧快照重新记账了）"
+        );
+        assert_eq!(
+            db.load_char_orders(CHAR_ID).unwrap().len(),
+            1,
+            "旧快照也该原样留着（同步失败不得清表）"
+        );
+        assert!(
+            db.char_meta(CHAR_ID).unwrap().is_none(),
+            "全灭的一轮不算'同步过'：不刷 last_sync_at、不建行"
+        );
     }
 }
